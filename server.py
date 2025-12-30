@@ -74,6 +74,9 @@ def clean(v):
 # ===============================
 @app.post("/tv")
 async def tv_webhook(req: Request):
+    print("\n✅✅✅ /tv HIT (request received) ✅✅✅")
+    print(f"content-type: {req.headers.get('content-type')}")
+
     try:
         data = await req.json()
     except Exception:
