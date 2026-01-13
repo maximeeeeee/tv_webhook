@@ -194,4 +194,10 @@ async def tv_webhook(req: Request):
         return {"ok": True, "mode": "safe", "body": body, "tv_order_id": tv_order_id, "tv_comment": tv_comment}
 
     r = requests.post(url, headers=headers, data=body_str, timeout=15)
+
+    # ✅ NEW: log Bitget response (no logic change)
+    print("\n=== BITGET RESPONSE ===")
+    print("status:", r.status_code)
+    print("body:", r.text)
+
     return {"ok": r.ok, "status": r.status_code, "response": r.text, "tv_order_id": tv_order_id, "tv_comment": tv_comment}
