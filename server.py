@@ -5,6 +5,7 @@ import hmac
 import base64
 import hashlib
 import requests
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from fastapi import FastAPI, Request, HTTPException
 
 app = FastAPI()
@@ -33,6 +34,13 @@ BITGET_LIVE_TRADING = os.getenv("BITGET_LIVE_TRADING", "false").lower() == "true
 PRODUCT_TYPE = "USDT-FUTURES"
 MARGIN_MODE = "crossed"
 MARGIN_COIN = "USDT"
+
+# ===============================
+# Price tick size (Bitget error 45115)
+# Default tick size for BTCUSDT is commonly 0.1.
+# You can override in Render env vars: PRICE_TICK_SIZE=0.1
+# ===============================
+PRICE_TICK_SIZE = os.getenv("PRICE_TICK_SIZE", "0.1")
 
 # ===============================
 # Skip rules
@@ -89,6 +97,25 @@ def parse_bool(v) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def quantize_to_tick(value, tick: str):
+    """
+    Round value to the nearest multiple of tick (e.g. tick="0.1") and return as string.
+    If value is None/empty -> None.
+    """
+    v = clean(value)
+    if v is None:
+        return None
+    try:
+        d = Decimal(v)
+        t = Decimal(str(tick))
+        # nearest tick (ROUND_HALF_UP)
+        q = (d / t).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * t
+        # return without scientific notation
+        return format(q.normalize(), "f")
+    except (InvalidOperation, ValueError):
+        return None
+
+
 # ===============================
 # Webhook
 # ===============================
@@ -141,10 +168,20 @@ async def tv_webhook(req: Request):
     reduce_only = "YES" if reduce_only_bool else "NO"
     trade_side = "close" if reduce_only == "YES" else "open"
 
+    # Raw values from TV
     price = clean(extra.get("price") or data.get("price"))
     tp_trigger = clean(extra.get("tp_trigger") or data.get("tp_trigger"))
     tp_exec = clean(extra.get("tp_exec") or data.get("tp_exec"))
     sl = clean(extra.get("sl") or data.get("sl"))
+
+    # ✅ Quantize to tick size to satisfy Bitget (error 45115)
+    price = quantize_to_tick(price, PRICE_TICK_SIZE)
+    tp_trigger = quantize_to_tick(tp_trigger, PRICE_TICK_SIZE)
+    tp_exec = quantize_to_tick(tp_exec, PRICE_TICK_SIZE)
+    sl = quantize_to_tick(sl, PRICE_TICK_SIZE)
+
+    print("\n=== QUANTIZED PRICES ===")
+    print("tick:", PRICE_TICK_SIZE, "| price:", price, "| tp_trigger:", tp_trigger, "| tp_exec:", tp_exec, "| sl:", sl)
 
     path = "/api/v2/mix/order/place-order"
     url = BITGET_BASE_URL + path
@@ -165,7 +202,7 @@ async def tv_webhook(req: Request):
         body["price"] = price
         body["force"] = "gtc"
 
-    # 🔥 Trigger + Exec TP
+    # 🔥 Trigger + Exec TP (UNCHANGED logic)
     if tp_trigger and tp_exec:
         body["presetStopSurplusPrice"] = tp_trigger
         body["presetStopSurplusExecutePrice"] = tp_exec
@@ -195,7 +232,7 @@ async def tv_webhook(req: Request):
 
     r = requests.post(url, headers=headers, data=body_str, timeout=15)
 
-    # ✅ NEW: log Bitget response (no logic change)
+    # ✅ Log Bitget response
     print("\n=== BITGET RESPONSE ===")
     print("status:", r.status_code)
     print("body:", r.text)
