@@ -29,7 +29,7 @@ HL_LIVE_TRADING = os.getenv("HL_LIVE_TRADING", "false").lower() == "true"
 # Market slippage tolerance (used for market-style IOC pricing)
 HL_SLIPPAGE = os.getenv("HL_SLIPPAGE", "0.01")  # 1% default
 
-# Skip rules (same as your Bitget server)
+# Skip rules
 TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 
 # ===============================
@@ -54,7 +54,6 @@ def get_hl_clients():
         )
 
     if _info is None:
-        # Note: Info() may call /info internally; we do it only on demand
         _info = Info(HL_BASE_URL, skip_ws=True)
 
     if _exchange is None:
@@ -98,12 +97,10 @@ def normalize_tv_symbol_to_hl(symbol: str) -> str:
     """
     s = str(symbol).strip().upper()
 
-    # Remove common suffixes
     for suf in [".P", "PERP", "-PERP", "_PERP"]:
         if s.endswith(suf):
             s = s[: -len(suf)]
 
-    # Convert BTCUSDT -> BTC
     if s.endswith("USDT") and len(s) > 4:
         s = s[:-4]
 
@@ -111,12 +108,8 @@ def normalize_tv_symbol_to_hl(symbol: str) -> str:
 
 
 def is_rate_limited_error(e: Exception) -> bool:
-    """
-    Hyperliquid SDK raises ClientError with text containing "(429, ...)".
-    We detect 429 robustly via string match.
-    """
     msg = str(e)
-    return "429" in msg or "rate" in msg.lower() and "limit" in msg.lower()
+    return "429" in msg or ("rate" in msg.lower() and "limit" in msg.lower())
 
 
 # ===============================
@@ -127,7 +120,6 @@ async def tv_webhook(req: Request):
     print("\n✅✅✅ /tv HIT (request received) ✅✅✅")
     print(f"content-type: {req.headers.get('content-type')}")
 
-    # tolerant JSON parsing (works for application/json AND text/plain)
     raw = await req.body()
     text = raw.decode("utf-8", errors="replace").strip()
 
@@ -158,10 +150,9 @@ async def tv_webhook(req: Request):
 
     extra = data.get("extra") or {}
 
-    # --- Extract fields ---
     coin = normalize_tv_symbol_to_hl(data.get("symbol", ""))
 
-    action = str(data.get("action", "")).lower()  # "buy" or "sell"
+    action = str(data.get("action", "")).lower()
     if action not in ("buy", "sell"):
         raise HTTPException(status_code=400, detail="Invalid action (must be buy or sell)")
     is_buy = action == "buy"
@@ -175,13 +166,12 @@ async def tv_webhook(req: Request):
         raise HTTPException(status_code=400, detail="Invalid qty")
 
     order_type = (extra.get("order_type") or data.get("order_type") or "market").lower()
+
     reduce_only_bool = parse_bool(extra.get("reduce_only", data.get("reduce_only", False)))
 
-    # Optional TP/SL from TV
     tp_trigger = to_decimal(extra.get("tp_trigger") or data.get("tp_trigger"))
     sl_trigger = to_decimal(extra.get("sl") or data.get("sl"))
 
-    # Optional limit price
     limit_price = to_decimal(extra.get("price") or data.get("price"))
 
     print("\n=== Parsed ===")
@@ -218,9 +208,7 @@ async def tv_webhook(req: Request):
         if order_type == "market":
             slippage = Decimal(str(HL_SLIPPAGE))
 
-            # market_close/market_open wrappers in SDK might not expose reduce_only in all versions
-            # So we do aggressive IOC limit ourselves to support reduce-only reliably.
-            mids = info.all_mids()  # may rate-limit sometimes
+            mids = info.all_mids()
             if coin not in mids:
                 raise HTTPException(status_code=400, detail=f"Unknown coin for mids: {coin}")
 
@@ -252,32 +240,29 @@ async def tv_webhook(req: Request):
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported order_type: {order_type}")
 
-   except Exception as e:
-    err = str(e)
+    except Exception as e:
+        err = str(e)
 
-    print("\n❌ HYPERLIQUID ORDER ERROR ❌")
-    print(err)
+        print("\n❌ HYPERLIQUID ORDER ERROR ❌")
+        print(err)
 
-    # Explicitly return the real error to the client/logs
-    if is_rate_limited_error(e):
+        if is_rate_limited_error(e):
+            raise HTTPException(
+                status_code=503,
+                detail="Hyperliquid rate limited (429). Retry in a few seconds.",
+            )
+
         raise HTTPException(
-            status_code=503,
-            detail="Hyperliquid rate limited (429). Retry in a few seconds."
+            status_code=500,
+            detail=f"Hyperliquid order failed: {err}",
         )
-
-    raise HTTPException(
-        status_code=500,
-        detail=f"Hyperliquid order failed: {err}"
-    )
-
 
     print("\n=== HL MAIN ORDER RESPONSE ===")
     print(main_result)
 
-    # --- Optional TP/SL as trigger orders (separate orders) ---
-    # For a long entry (buy), TP/SL are sells; for a short entry (sell), TP/SL are buys.
+    # --- Optional TP/SL trigger orders ---
     tpsl_results = []
-    tpsl_is_buy = not is_buy
+    tpsl_is_buy = not is_buy  # opposite side
 
     try:
         if tp_trigger:
@@ -303,7 +288,6 @@ async def tv_webhook(req: Request):
             tpsl_results.append({"sl": sl_res})
 
     except Exception as e:
-        # Do not fail the whole webhook if TP/SL fails
         if is_rate_limited_error(e):
             tpsl_results.append({"warning": "TP/SL not placed due to 429 rate limit. Retry later."})
         else:
