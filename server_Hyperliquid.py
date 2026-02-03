@@ -62,23 +62,17 @@ def get_hl_clients():
         _info = Info(HL_BASE_URL, skip_ws=True)
 
     if _exchange is None:
-        # --- IMPORTANT ---
-        # Your error shows the SDK expects "wallet" as the first argument (or wallet=...),
-        # not (account_address, secret_key, base_url=...).
-        #
-        # We build a wallet from the private key, and also pass account_address explicitly
-        # (because with API wallets, the signing key can differ from the main account).
+        # Build a wallet from the private key. Keep account_address as the main account.
         wallet = Account.from_key(HL_SECRET_KEY)
 
         try:
-            # Newer/common style: Exchange(wallet=..., base_url=..., account_address=...)
+            # Common style: Exchange(wallet=..., base_url=..., account_address=...)
             _exchange = Exchange(wallet=wallet, base_url=HL_BASE_URL, account_address=HL_ACCOUNT_ADDRESS)
         except TypeError:
             # Fallbacks for other SDK variants
             try:
                 _exchange = Exchange(wallet, HL_BASE_URL, HL_ACCOUNT_ADDRESS)
             except TypeError:
-                # Last fallback: older tutorials show Exchange(address, private, base_url=...)
                 _exchange = Exchange(HL_ACCOUNT_ADDRESS, HL_SECRET_KEY, base_url=HL_BASE_URL)
 
     return _info, _exchange
@@ -143,6 +137,49 @@ def log_exception(prefix: str, e: Exception):
     print("\n--- TRACEBACK ---")
     print(traceback.format_exc())
     print("--- END TRACEBACK ---\n")
+
+
+def get_px_step(info: Info, coin: str) -> Decimal:
+    """
+    Return the price tick size (pxStep) for the given coin from Hyperliquid meta.
+    Fallback to 0.1 if anything fails.
+    """
+    try:
+        meta = info.meta()
+        universe = meta.get("universe", [])
+        for a in universe:
+            if a.get("name") == coin and a.get("pxStep") is not None:
+                return Decimal(str(a["pxStep"]))
+    except Exception as e:
+        print("⚠️ Could not fetch pxStep from meta:", e)
+
+    # Safe fallback (BTC is typically 0.1 on many venues, but this is just a fallback)
+    return Decimal("0.1")
+
+
+def round_to_step(x: Decimal, step: Decimal) -> Decimal:
+    """
+    Round DOWN to the nearest valid tick (step).
+    Floor rounding avoids invalid price due to too many decimals.
+    """
+    if step <= 0:
+        return x
+    return (x // step) * step
+
+
+def order_ok_or_error(main_result: dict) -> str | None:
+    """
+    Hyperliquid often returns HTTP 200 with embedded order errors.
+    Return error string if present, otherwise None.
+    """
+    try:
+        statuses = main_result.get("response", {}).get("data", {}).get("statuses", [])
+        for s in statuses:
+            if isinstance(s, dict) and "error" in s:
+                return str(s["error"])
+    except Exception:
+        return "Unknown order error (could not parse statuses)"
+    return None
 
 
 # ===============================
@@ -246,7 +283,13 @@ async def tv_webhook(req: Request):
                 raise HTTPException(status_code=400, detail=f"Unknown coin for mids: {coin}")
 
             mid = Decimal(str(mids[coin]))
-            px = mid * (Decimal("1") + slippage) if is_buy else mid * (Decimal("1") - slippage)
+
+            # Compute aggressive IOC price then round to tick size
+            px_raw = mid * (Decimal("1") + slippage) if is_buy else mid * (Decimal("1") - slippage)
+            px_step = get_px_step(info, coin)
+            px = round_to_step(px_raw, px_step)
+
+            print(f"\n=== PRICE DEBUG === coin={coin} mid={mid} px_raw={px_raw} px_step={px_step} px_rounded={px}")
 
             main_result = exchange.order(
                 coin,
@@ -261,11 +304,16 @@ async def tv_webhook(req: Request):
             if limit_price is None:
                 raise HTTPException(status_code=400, detail="Limit order requires price")
 
+            # Round limit price to tick too
+            px_step = get_px_step(info, coin)
+            lp = round_to_step(Decimal(str(limit_price)), px_step)
+            print(f"\n=== LIMIT PRICE DEBUG === coin={coin} limit_price_raw={limit_price} px_step={px_step} limit_price_rounded={lp}")
+
             main_result = exchange.order(
                 coin,
                 is_buy,
                 float(sz),
-                float(limit_price),
+                float(lp),
                 {"limit": {"tif": "Gtc"}},
                 reduce_only=reduce_only_bool,
             )
@@ -289,6 +337,13 @@ async def tv_webhook(req: Request):
 
     print("\n=== HL MAIN ORDER RESPONSE ===")
     print(main_result)
+
+    # If HL returns embedded error despite HTTP 200, surface it
+    embedded_err = order_ok_or_error(main_result)
+    if embedded_err:
+        print("\n❌❌❌ HYPERLIQUID EMBEDDED ORDER ERROR ❌❌❌")
+        print(embedded_err)
+        raise HTTPException(status_code=500, detail=f"Hyperliquid order error: {embedded_err}")
 
     # --- Optional TP/SL trigger orders ---
     tpsl_results = []
