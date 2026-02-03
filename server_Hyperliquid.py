@@ -8,6 +8,10 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
+# NOTE: eth_account is commonly available via dependencies.
+# If you get "ModuleNotFoundError: eth_account", add "eth-account" to requirements.txt.
+from eth_account import Account
+
 app = FastAPI()
 
 # ===============================
@@ -58,7 +62,24 @@ def get_hl_clients():
         _info = Info(HL_BASE_URL, skip_ws=True)
 
     if _exchange is None:
-        _exchange = Exchange(HL_ACCOUNT_ADDRESS, HL_SECRET_KEY, base_url=HL_BASE_URL)
+        # --- IMPORTANT ---
+        # Your error shows the SDK expects "wallet" as the first argument (or wallet=...),
+        # not (account_address, secret_key, base_url=...).
+        #
+        # We build a wallet from the private key, and also pass account_address explicitly
+        # (because with API wallets, the signing key can differ from the main account).
+        wallet = Account.from_key(HL_SECRET_KEY)
+
+        try:
+            # Newer/common style: Exchange(wallet=..., base_url=..., account_address=...)
+            _exchange = Exchange(wallet=wallet, base_url=HL_BASE_URL, account_address=HL_ACCOUNT_ADDRESS)
+        except TypeError:
+            # Fallbacks for other SDK variants
+            try:
+                _exchange = Exchange(wallet, HL_BASE_URL, HL_ACCOUNT_ADDRESS)
+            except TypeError:
+                # Last fallback: older tutorials show Exchange(address, private, base_url=...)
+                _exchange = Exchange(HL_ACCOUNT_ADDRESS, HL_SECRET_KEY, base_url=HL_BASE_URL)
 
     return _info, _exchange
 
@@ -110,18 +131,18 @@ def normalize_tv_symbol_to_hl(symbol: str) -> str:
 
 def is_rate_limited_error(e: Exception) -> bool:
     msg = str(e)
-    return "429" in msg or ("rate" in msg.lower() and "limit" in msg.lower())
+    return ("429" in msg) or ("rate" in msg.lower() and "limit" in msg.lower())
 
 
-def log_and_fail(prefix: str, e: Exception):
+def log_exception(prefix: str, e: Exception):
     """
-    Print the full error + traceback to Render logs (Bitget-style),
-    then return a 500 with the error text.
+    Bitget-style logging: prints full error + full traceback in Render logs.
     """
-    print("\n❌❌❌ " + prefix + " ❌❌❌")
+    print(f"\n{prefix}")
     print(str(e))
-    traceback.print_exc()
-    raise HTTPException(status_code=500, detail=f"{prefix}: {e}")
+    print("\n--- TRACEBACK ---")
+    print(traceback.format_exc())
+    print("--- END TRACEBACK ---\n")
 
 
 # ===============================
@@ -141,7 +162,8 @@ async def tv_webhook(req: Request):
 
     try:
         data = json.loads(text)
-    except Exception:
+    except Exception as e:
+        log_exception("❌ INVALID JSON BODY ❌", e)
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     if data.get("token") != TV_WEBHOOK_TOKEN:
@@ -207,21 +229,23 @@ async def tv_webhook(req: Request):
             "tv_comment": tv_comment,
         }
 
-    # --- LIVE EXECUTION (FULLY GUARDED, PRINTS ERRORS TO LOGS) ---
+    # --- Lazy init clients (only now) ---
     try:
-        # Init clients
         info, exchange = get_hl_clients()
+    except Exception as e:
+        log_exception("❌ HYPERLIQUID CLIENT INIT FAILED ❌", e)
+        raise HTTPException(status_code=500, detail=f"Hyperliquid client init failed: {e}")
 
-        # Fetch mids (often where HL errors show up)
-        mids = info.all_mids()
-        if coin not in mids:
-            raise Exception(f"Coin not found in mids: {coin}")
-
-        mid = Decimal(str(mids[coin]))
-
-        # Place main order
+    # --- Place main order ---
+    try:
         if order_type == "market":
             slippage = Decimal(str(HL_SLIPPAGE))
+
+            mids = info.all_mids()
+            if coin not in mids:
+                raise HTTPException(status_code=400, detail=f"Unknown coin for mids: {coin}")
+
+            mid = Decimal(str(mids[coin]))
             px = mid * (Decimal("1") + slippage) if is_buy else mid * (Decimal("1") - slippage)
 
             main_result = exchange.order(
@@ -235,7 +259,7 @@ async def tv_webhook(req: Request):
 
         elif order_type == "limit":
             if limit_price is None:
-                raise Exception("Limit order requires price")
+                raise HTTPException(status_code=400, detail="Limit order requires price")
 
             main_result = exchange.order(
                 coin,
@@ -247,20 +271,24 @@ async def tv_webhook(req: Request):
             )
 
         else:
-            raise Exception(f"Unsupported order_type: {order_type}")
-
-        print("\n=== HL MAIN ORDER RESPONSE ===")
-        print(main_result)
+            raise HTTPException(status_code=400, detail=f"Unsupported order_type: {order_type}")
 
     except Exception as e:
-        # Print EVERYTHING to Render logs
-        if is_rate_limited_error(e):
-            print("\n⚠️ HYPERLIQUID RATE LIMIT (429)")
-            print(str(e))
-            traceback.print_exc()
-            raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429). Retry in a few seconds.")
+        log_exception("❌❌❌ HYPERLIQUID LIVE ORDER FAILED ❌❌❌", e)
 
-        log_and_fail("HYPERLIQUID LIVE ORDER FAILED", e)
+        if is_rate_limited_error(e):
+            raise HTTPException(
+                status_code=503,
+                detail="Hyperliquid rate limited (429). Retry in a few seconds.",
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Hyperliquid order failed: {e}",
+        )
+
+    print("\n=== HL MAIN ORDER RESPONSE ===")
+    print(main_result)
 
     # --- Optional TP/SL trigger orders ---
     tpsl_results = []
@@ -290,10 +318,11 @@ async def tv_webhook(req: Request):
             tpsl_results.append({"sl": sl_res})
 
     except Exception as e:
-        print("\n⚠️ TP/SL ERROR (non-fatal)")
-        print(str(e))
-        traceback.print_exc()
-        tpsl_results.append({"warning": f"TP/SL not placed: {e}"})
+        log_exception("⚠️ TP/SL PLACEMENT WARNING ⚠️", e)
+        if is_rate_limited_error(e):
+            tpsl_results.append({"warning": "TP/SL not placed due to 429 rate limit. Retry later."})
+        else:
+            tpsl_results.append({"warning": f"TP/SL not placed: {e}"})
 
     return {
         "ok": True,
