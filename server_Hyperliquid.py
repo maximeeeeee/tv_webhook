@@ -2,6 +2,8 @@ import os
 import json
 import traceback
 from decimal import Decimal, InvalidOperation
+from time import time
+
 from fastapi import FastAPI, Request, HTTPException
 
 from hyperliquid.exchange import Exchange
@@ -43,6 +45,27 @@ TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 # ===============================
 _info = None
 _exchange = None
+
+# ===============================
+# Simple idempotency (prevents TV retry duplicates)
+# In-memory dedup (single instance). For multi-instance, use Redis.
+# ===============================
+_seen = {}  # tv_order_id -> ts
+DEDUP_TTL = 60  # seconds
+
+
+def seen_recently(k: str) -> bool:
+    now = time()
+    # cleanup
+    for key, ts in list(_seen.items()):
+        if now - ts > DEDUP_TTL:
+            _seen.pop(key, None)
+    if not k:
+        return False
+    if k in _seen:
+        return True
+    _seen[k] = now
+    return False
 
 
 def get_hl_clients():
@@ -105,10 +128,14 @@ def to_decimal(v):
 
 def normalize_tv_symbol_to_hl(symbol: str) -> str:
     """
-    TradingView sends symbols like BTCUSDT / BTCUSDT.P / ETHUSDT etc.
+    TradingView sends symbols like BTCUSDT / BTCUSDT.P / BINANCE:BTCUSDT etc.
     Hyperliquid perp "coin" is usually BTC / ETH / etc.
     """
     s = str(symbol).strip().upper()
+
+    # Handle prefixes like BINANCE:BTCUSDT
+    if ":" in s:
+        s = s.split(":")[-1]
 
     for suf in [".P", "PERP", "-PERP", "_PERP"]:
         if s.endswith(suf):
@@ -136,13 +163,28 @@ def log_exception(prefix: str, e: Exception):
     print("--- END TRACEBACK ---\n")
 
 
+# ===============================
+# Meta caching (reduce calls, lower 429 risk)
+# ===============================
+_meta_cache = {"ts": 0, "data": None}
+META_TTL_SEC = 300  # 5 minutes
+
+
+def get_meta_cached(info: Info):
+    now = time()
+    if _meta_cache["data"] is None or now - _meta_cache["ts"] > META_TTL_SEC:
+        _meta_cache["data"] = info.meta()
+        _meta_cache["ts"] = now
+    return _meta_cache["data"]
+
+
 def get_px_step(info: Info, coin: str) -> Decimal:
     """
     Return the price tick size (pxStep) for the given coin from Hyperliquid meta.
     Fallback to 0.1 if anything fails.
     """
     try:
-        meta = info.meta()
+        meta = get_meta_cached(info)
         universe = meta.get("universe", [])
         for a in universe:
             if a.get("name") == coin and a.get("pxStep") is not None:
@@ -153,25 +195,35 @@ def get_px_step(info: Info, coin: str) -> Decimal:
     return Decimal("0.1")
 
 
+def get_sz_step(info: Info, coin: str) -> Decimal:
+    """
+    Return the size step (lot step) for the given coin.
+    If szStep exists, use it. Else derive from szDecimals.
+    """
+    try:
+        meta = get_meta_cached(info)
+        universe = meta.get("universe", [])
+        for a in universe:
+            if a.get("name") == coin:
+                if a.get("szStep") is not None:
+                    return Decimal(str(a["szStep"]))
+                if a.get("szDecimals") is not None:
+                    d = int(a["szDecimals"])
+                    return Decimal("1") / (Decimal("10") ** d)
+    except Exception as e:
+        print("⚠️ Could not fetch sz step from meta:", e)
+
+    return Decimal("0.001")  # conservative fallback
+
+
 def round_to_step(x: Decimal, step: Decimal) -> Decimal:
     """
-    Round DOWN to a valid tick size step using Decimal arithmetic.
+    Round DOWN to a valid tick/step size using Decimal arithmetic.
     """
     if step <= 0:
         return x
     n = (x / step).to_integral_value(rounding="ROUND_FLOOR")
     return n * step
-
-
-def dec_to_str(d: Decimal) -> str:
-    """
-    Convert Decimal to a clean string (no scientific notation),
-    and remove trailing zeros.
-    """
-    s = format(d, "f")
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s
 
 
 def order_ok_or_error(main_result: dict):
@@ -184,6 +236,8 @@ def order_ok_or_error(main_result: dict):
         for s in statuses:
             if isinstance(s, dict) and "error" in s:
                 return str(s["error"])
+        if not statuses:
+            return "No statuses returned (suspicious response)"
     except Exception:
         return "Unknown order error (could not parse statuses)"
     return None
@@ -220,6 +274,11 @@ async def tv_webhook(req: Request):
 
     tv_order_id = str(data.get("tv_order_id", "")).strip()
     tv_comment = str(data.get("tv_comment", "")).strip()
+
+    # Idempotency: ignore duplicates from retries
+    if seen_recently(tv_order_id):
+        print(f"⏭️ DUPLICATE webhook ignored: {tv_order_id}")
+        return {"ok": True, "mode": "deduped", "tv_order_id": tv_order_id}
 
     if tv_order_id in TV_SKIP_ORDER_IDS:
         print(f"⏭️ SKIPPED: {tv_order_id}")
@@ -279,6 +338,27 @@ async def tv_webhook(req: Request):
         log_exception("❌ HYPERLIQUID CLIENT INIT FAILED ❌", e)
         raise HTTPException(status_code=500, detail=f"Hyperliquid client init failed: {e}")
 
+    # --- Enforce size step (lot step) ---
+    try:
+        sz_step = get_sz_step(info, coin)
+        sz_rounded = round_to_step(sz, sz_step)
+        if sz_rounded <= 0:
+            raise HTTPException(status_code=400, detail=f"Qty too small after rounding to lot step: {sz_step}")
+        if sz_rounded != sz:
+            print(f"ℹ️ Size rounded: raw_sz={sz} sz_step={sz_step} sz_rounded={sz_rounded}")
+        sz = sz_rounded
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_exception("⚠️ SIZE STEP CHECK WARNING ⚠️", e)
+        # Continue with original sz if meta fails; HL may still accept it.
+
+    # --- Helpers for rounding trigger prices ---
+    px_step = get_px_step(info, coin)
+
+    def round_px_str(v: Decimal) -> str:
+        return str(round_to_step(Decimal(str(v)), px_step))
+
     # --- Place main order ---
     try:
         if order_type == "market":
@@ -291,16 +371,16 @@ async def tv_webhook(req: Request):
             mid = Decimal(str(mids[coin]))
 
             px_raw = mid * (Decimal("1") + slippage) if is_buy else mid * (Decimal("1") - slippage)
-            px_step = get_px_step(info, coin)
             px = round_to_step(px_raw, px_step)
 
             print(f"\n=== PRICE DEBUG === coin={coin} mid={mid} px_raw={px_raw} px_step={px_step} px_rounded={px}")
 
+            # ✅ IMPORTANT FIX: HL SDK expects limit_px as FLOAT, not string
             main_result = exchange.order(
                 coin,
                 is_buy,
                 float(sz),
-                dec_to_str(px),  # ✅ price as string to avoid float precision issues
+                float(px),  # ✅ must be float (fixes "Unknown format code 'f' for str")
                 {"limit": {"tif": "Ioc"}},
                 reduce_only=reduce_only_bool,
             )
@@ -309,16 +389,16 @@ async def tv_webhook(req: Request):
             if limit_price is None:
                 raise HTTPException(status_code=400, detail="Limit order requires price")
 
-            px_step = get_px_step(info, coin)
             lp = round_to_step(Decimal(str(limit_price)), px_step)
 
             print(f"\n=== LIMIT PRICE DEBUG === coin={coin} limit_price_raw={limit_price} px_step={px_step} limit_price_rounded={lp}")
 
+            # ✅ IMPORTANT FIX: HL SDK expects limit_px as FLOAT, not string
             main_result = exchange.order(
                 coin,
                 is_buy,
                 float(sz),
-                dec_to_str(lp),  # ✅ price as string
+                float(lp),  # ✅ must be float
                 {"limit": {"tif": "Gtc"}},
                 reduce_only=reduce_only_bool,
             )
@@ -359,8 +439,8 @@ async def tv_webhook(req: Request):
                 coin,
                 tpsl_is_buy,
                 float(sz),
-                "0",
-                {"trigger": {"isMarket": True, "triggerPx": str(tp_trigger), "tpsl": "tp"}},
+                0.0,
+                {"trigger": {"isMarket": True, "triggerPx": round_px_str(tp_trigger), "tpsl": "tp"}},
                 reduce_only=True,
             )
             tpsl_results.append({"tp": tp_res})
@@ -370,8 +450,8 @@ async def tv_webhook(req: Request):
                 coin,
                 tpsl_is_buy,
                 float(sz),
-                "0",
-                {"trigger": {"isMarket": True, "triggerPx": str(sl_trigger), "tpsl": "sl"}},
+                0.0,
+                {"trigger": {"isMarket": True, "triggerPx": round_px_str(sl_trigger), "tpsl": "sl"}},
                 reduce_only=True,
             )
             tpsl_results.append({"sl": sl_res})
