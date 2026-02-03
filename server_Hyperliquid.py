@@ -3,6 +3,7 @@ import json
 import traceback
 from decimal import Decimal, InvalidOperation
 from time import time
+from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException
 
@@ -10,8 +11,7 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
-# NOTE: eth_account is commonly available via dependencies.
-# If you get "ModuleNotFoundError: eth_account", add "eth-account" to requirements.txt.
+# NOTE: If you get "ModuleNotFoundError: eth_account", add "eth-account" to requirements.txt.
 from eth_account import Account
 
 app = FastAPI()
@@ -87,6 +87,7 @@ def get_hl_clients():
     if _exchange is None:
         wallet = Account.from_key(HL_SECRET_KEY)
 
+        # Support multiple SDK signatures
         try:
             _exchange = Exchange(wallet=wallet, base_url=HL_BASE_URL, account_address=HL_ACCOUNT_ADDRESS)
         except TypeError:
@@ -178,21 +179,98 @@ def get_meta_cached(info: Info):
     return _meta_cache["data"]
 
 
+# ===============================
+# Tick / Step handling
+# ===============================
+def round_to_step(x: Decimal, step: Decimal) -> Decimal:
+    """
+    Round DOWN to a valid tick/step size using Decimal arithmetic.
+    """
+    if step <= 0:
+        return x
+    n = (x / step).to_integral_value(rounding="ROUND_FLOOR")
+    return n * step
+
+
+def infer_px_step_from_l2(info: Info, coin: str) -> Optional[Decimal]:
+    """
+    Infer tick size from L2 snapshot by taking the minimum positive difference
+    between adjacent price levels. Works even if meta() parsing fails.
+    """
+    try:
+        snap = info.l2_snapshot(coin)
+        levels = snap.get("levels", [])
+        if not levels or len(levels) < 2:
+            return None
+
+        def extract_prices(side_levels):
+            prices = []
+            for lvl in side_levels:
+                # Handle both [px, sz] and {"px": ..., "sz": ...}
+                if isinstance(lvl, (list, tuple)) and len(lvl) >= 1:
+                    prices.append(Decimal(str(lvl[0])))
+                elif isinstance(lvl, dict) and "px" in lvl:
+                    prices.append(Decimal(str(lvl["px"])))
+            return prices
+
+        bids = extract_prices(levels[0]) if len(levels) > 0 else []
+        asks = extract_prices(levels[1]) if len(levels) > 1 else []
+
+        prices = sorted(set(bids + asks))
+        if len(prices) < 2:
+            return None
+
+        diffs = []
+        for i in range(1, len(prices)):
+            d = prices[i] - prices[i - 1]
+            if d > 0:
+                diffs.append(d)
+
+        if not diffs:
+            return None
+
+        return min(diffs)
+
+    except Exception as e:
+        print(f"⚠️ Could not infer pxStep from L2 for {coin}: {e}")
+        return None
+
+
 def get_px_step(info: Info, coin: str) -> Decimal:
     """
-    Return the price tick size (pxStep) for the given coin from Hyperliquid meta.
-    Fallback to 0.1 if anything fails.
+    Return price tick size for coin:
+    1) meta() pxStep or pxDecimals
+    2) infer from L2 orderbook
+    3) fallback to 1 (safe for integer books like BTC)
     """
     try:
         meta = get_meta_cached(info)
         universe = meta.get("universe", [])
-        for a in universe:
-            if a.get("name") == coin and a.get("pxStep") is not None:
-                return Decimal(str(a["pxStep"]))
-    except Exception as e:
-        print("⚠️ Could not fetch pxStep from meta:", e)
 
-    return Decimal("0.1")
+        for a in universe:
+            if str(a.get("name", "")).upper() == coin.upper():
+                if a.get("pxStep") is not None:
+                    step = Decimal(str(a["pxStep"]))
+                    print(f"✅ pxStep from meta: coin={coin} pxStep={step}")
+                    return step
+                if a.get("pxDecimals") is not None:
+                    d = int(a["pxDecimals"])
+                    step = Decimal("1") / (Decimal("10") ** d)
+                    print(f"✅ pxStep from meta(pxDecimals): coin={coin} pxStep={step}")
+                    return step
+
+        print(f"⚠️ pxStep NOT FOUND in meta() for coin={coin}. Trying L2 inference...")
+
+    except Exception as e:
+        print("⚠️ meta() pxStep lookup failed:", e)
+
+    inferred = infer_px_step_from_l2(info, coin)
+    if inferred is not None:
+        print(f"✅ Inferred pxStep from L2: coin={coin} pxStep={inferred}")
+        return inferred
+
+    print(f"⚠️ Falling back to pxStep=1 for coin={coin}")
+    return Decimal("1")
 
 
 def get_sz_step(info: Info, coin: str) -> Decimal:
@@ -204,26 +282,30 @@ def get_sz_step(info: Info, coin: str) -> Decimal:
         meta = get_meta_cached(info)
         universe = meta.get("universe", [])
         for a in universe:
-            if a.get("name") == coin:
+            if str(a.get("name", "")).upper() == coin.upper():
                 if a.get("szStep") is not None:
-                    return Decimal(str(a["szStep"]))
+                    step = Decimal(str(a["szStep"]))
+                    print(f"✅ szStep from meta: coin={coin} szStep={step}")
+                    return step
                 if a.get("szDecimals") is not None:
                     d = int(a["szDecimals"])
-                    return Decimal("1") / (Decimal("10") ** d)
+                    step = Decimal("1") / (Decimal("10") ** d)
+                    print(f"✅ szStep from meta(szDecimals): coin={coin} szStep={step}")
+                    return step
     except Exception as e:
-        print("⚠️ Could not fetch sz step from meta:", e)
+        print("⚠️ Could not fetch szStep from meta:", e)
 
     return Decimal("0.001")  # conservative fallback
 
 
-def round_to_step(x: Decimal, step: Decimal) -> Decimal:
+def tick_ok(px: Decimal, step: Decimal) -> bool:
     """
-    Round DOWN to a valid tick/step size using Decimal arithmetic.
+    True if px is divisible by step.
     """
     if step <= 0:
-        return x
-    n = (x / step).to_integral_value(rounding="ROUND_FLOOR")
-    return n * step
+        return True
+    q = px / step
+    return q == q.to_integral_value()
 
 
 def order_ok_or_error(main_result: dict):
@@ -254,6 +336,7 @@ async def tv_webhook(req: Request):
     raw = await req.body()
     text = raw.decode("utf-8", errors="replace").strip()
 
+    # handle body being double-quoted JSON string
     if text.startswith('"') and text.endswith('"'):
         text = text[1:-1].replace('\\"', '"')
 
@@ -353,10 +436,11 @@ async def tv_webhook(req: Request):
         log_exception("⚠️ SIZE STEP CHECK WARNING ⚠️", e)
         # Continue with original sz if meta fails; HL may still accept it.
 
-    # --- Helpers for rounding trigger prices ---
+    # --- Get pxStep (robust: meta -> L2 inference -> fallback) ---
     px_step = get_px_step(info, coin)
 
-    def round_px_str(v: Decimal) -> str:
+    def round_trigger_px_str(v: Decimal) -> str:
+        # Triggers are passed as strings (works fine). We still align them to tick.
         return str(round_to_step(Decimal(str(v)), px_step))
 
     # --- Place main order ---
@@ -374,13 +458,17 @@ async def tv_webhook(req: Request):
             px = round_to_step(px_raw, px_step)
 
             print(f"\n=== PRICE DEBUG === coin={coin} mid={mid} px_raw={px_raw} px_step={px_step} px_rounded={px}")
+            print(f"=== TICK CHECK === px={px} px_step={px_step} tick_ok={tick_ok(px, px_step)}")
 
-            # ✅ IMPORTANT FIX: HL SDK expects limit_px as FLOAT, not string
+            if not tick_ok(px, px_step):
+                raise HTTPException(status_code=500, detail=f"Computed px is not divisible by tick: px={px} step={px_step}")
+
+            # ✅ IMPORTANT: HL SDK expects limit_px as FLOAT, not string
             main_result = exchange.order(
                 coin,
                 is_buy,
                 float(sz),
-                float(px),  # ✅ must be float (fixes "Unknown format code 'f' for str")
+                float(px),
                 {"limit": {"tif": "Ioc"}},
                 reduce_only=reduce_only_bool,
             )
@@ -392,13 +480,17 @@ async def tv_webhook(req: Request):
             lp = round_to_step(Decimal(str(limit_price)), px_step)
 
             print(f"\n=== LIMIT PRICE DEBUG === coin={coin} limit_price_raw={limit_price} px_step={px_step} limit_price_rounded={lp}")
+            print(f"=== TICK CHECK === lp={lp} px_step={px_step} tick_ok={tick_ok(lp, px_step)}")
 
-            # ✅ IMPORTANT FIX: HL SDK expects limit_px as FLOAT, not string
+            if not tick_ok(lp, px_step):
+                raise HTTPException(status_code=500, detail=f"Limit price not divisible by tick: lp={lp} step={px_step}")
+
+            # ✅ IMPORTANT: HL SDK expects limit_px as FLOAT, not string
             main_result = exchange.order(
                 coin,
                 is_buy,
                 float(sz),
-                float(lp),  # ✅ must be float
+                float(lp),
                 {"limit": {"tif": "Gtc"}},
                 reduce_only=reduce_only_bool,
             )
@@ -440,7 +532,7 @@ async def tv_webhook(req: Request):
                 tpsl_is_buy,
                 float(sz),
                 0.0,
-                {"trigger": {"isMarket": True, "triggerPx": round_px_str(tp_trigger), "tpsl": "tp"}},
+                {"trigger": {"isMarket": True, "triggerPx": round_trigger_px_str(tp_trigger), "tpsl": "tp"}},
                 reduce_only=True,
             )
             tpsl_results.append({"tp": tp_res})
@@ -451,7 +543,7 @@ async def tv_webhook(req: Request):
                 tpsl_is_buy,
                 float(sz),
                 0.0,
-                {"trigger": {"isMarket": True, "triggerPx": round_px_str(sl_trigger), "tpsl": "sl"}},
+                {"trigger": {"isMarket": True, "triggerPx": round_trigger_px_str(sl_trigger), "tpsl": "sl"}},
                 reduce_only=True,
             )
             tpsl_results.append({"sl": sl_res})
