@@ -252,10 +252,24 @@ async def tv_webhook(req: Request):
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported order_type: {order_type}")
 
-    except Exception as e:
-        if is_rate_limited_error(e):
-            raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429). Retry in a few seconds.")
-        raise HTTPException(status_code=500, detail=f"Main order failed: {e}")
+   except Exception as e:
+    err = str(e)
+
+    print("\n❌ HYPERLIQUID ORDER ERROR ❌")
+    print(err)
+
+    # Explicitly return the real error to the client/logs
+    if is_rate_limited_error(e):
+        raise HTTPException(
+            status_code=503,
+            detail="Hyperliquid rate limited (429). Retry in a few seconds."
+        )
+
+    raise HTTPException(
+        status_code=500,
+        detail=f"Hyperliquid order failed: {err}"
+    )
+
 
     print("\n=== HL MAIN ORDER RESPONSE ===")
     print(main_result)
