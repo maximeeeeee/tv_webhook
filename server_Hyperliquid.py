@@ -62,14 +62,11 @@ def get_hl_clients():
         _info = Info(HL_BASE_URL, skip_ws=True)
 
     if _exchange is None:
-        # Build a wallet from the private key. Keep account_address as the main account.
         wallet = Account.from_key(HL_SECRET_KEY)
 
         try:
-            # Common style: Exchange(wallet=..., base_url=..., account_address=...)
             _exchange = Exchange(wallet=wallet, base_url=HL_BASE_URL, account_address=HL_ACCOUNT_ADDRESS)
         except TypeError:
-            # Fallbacks for other SDK variants
             try:
                 _exchange = Exchange(wallet, HL_BASE_URL, HL_ACCOUNT_ADDRESS)
             except TypeError:
@@ -153,21 +150,31 @@ def get_px_step(info: Info, coin: str) -> Decimal:
     except Exception as e:
         print("⚠️ Could not fetch pxStep from meta:", e)
 
-    # Safe fallback (BTC is typically 0.1 on many venues, but this is just a fallback)
     return Decimal("0.1")
 
 
 def round_to_step(x: Decimal, step: Decimal) -> Decimal:
     """
-    Round DOWN to the nearest valid tick (step).
-    Floor rounding avoids invalid price due to too many decimals.
+    Round DOWN to a valid tick size step using Decimal arithmetic.
     """
     if step <= 0:
         return x
-    return (x // step) * step
+    n = (x / step).to_integral_value(rounding="ROUND_FLOOR")
+    return n * step
 
 
-def order_ok_or_error(main_result: dict) -> str | None:
+def dec_to_str(d: Decimal) -> str:
+    """
+    Convert Decimal to a clean string (no scientific notation),
+    and remove trailing zeros.
+    """
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
+def order_ok_or_error(main_result: dict):
     """
     Hyperliquid often returns HTTP 200 with embedded order errors.
     Return error string if present, otherwise None.
@@ -193,7 +200,6 @@ async def tv_webhook(req: Request):
     raw = await req.body()
     text = raw.decode("utf-8", errors="replace").strip()
 
-    # If some relay wrapped JSON into a quoted string, unquote it
     if text.startswith('"') and text.endswith('"'):
         text = text[1:-1].replace('\\"', '"')
 
@@ -284,7 +290,6 @@ async def tv_webhook(req: Request):
 
             mid = Decimal(str(mids[coin]))
 
-            # Compute aggressive IOC price then round to tick size
             px_raw = mid * (Decimal("1") + slippage) if is_buy else mid * (Decimal("1") - slippage)
             px_step = get_px_step(info, coin)
             px = round_to_step(px_raw, px_step)
@@ -295,7 +300,7 @@ async def tv_webhook(req: Request):
                 coin,
                 is_buy,
                 float(sz),
-                float(px),
+                dec_to_str(px),  # ✅ price as string to avoid float precision issues
                 {"limit": {"tif": "Ioc"}},
                 reduce_only=reduce_only_bool,
             )
@@ -304,16 +309,16 @@ async def tv_webhook(req: Request):
             if limit_price is None:
                 raise HTTPException(status_code=400, detail="Limit order requires price")
 
-            # Round limit price to tick too
             px_step = get_px_step(info, coin)
             lp = round_to_step(Decimal(str(limit_price)), px_step)
+
             print(f"\n=== LIMIT PRICE DEBUG === coin={coin} limit_price_raw={limit_price} px_step={px_step} limit_price_rounded={lp}")
 
             main_result = exchange.order(
                 coin,
                 is_buy,
                 float(sz),
-                float(lp),
+                dec_to_str(lp),  # ✅ price as string
                 {"limit": {"tif": "Gtc"}},
                 reduce_only=reduce_only_bool,
             )
@@ -338,7 +343,6 @@ async def tv_webhook(req: Request):
     print("\n=== HL MAIN ORDER RESPONSE ===")
     print(main_result)
 
-    # If HL returns embedded error despite HTTP 200, surface it
     embedded_err = order_ok_or_error(main_result)
     if embedded_err:
         print("\n❌❌❌ HYPERLIQUID EMBEDDED ORDER ERROR ❌❌❌")
@@ -347,7 +351,7 @@ async def tv_webhook(req: Request):
 
     # --- Optional TP/SL trigger orders ---
     tpsl_results = []
-    tpsl_is_buy = not is_buy  # opposite side
+    tpsl_is_buy = not is_buy
 
     try:
         if tp_trigger:
@@ -355,7 +359,7 @@ async def tv_webhook(req: Request):
                 coin,
                 tpsl_is_buy,
                 float(sz),
-                0.0,
+                "0",
                 {"trigger": {"isMarket": True, "triggerPx": str(tp_trigger), "tpsl": "tp"}},
                 reduce_only=True,
             )
@@ -366,7 +370,7 @@ async def tv_webhook(req: Request):
                 coin,
                 tpsl_is_buy,
                 float(sz),
-                0.0,
+                "0",
                 {"trigger": {"isMarket": True, "triggerPx": str(sl_trigger), "tpsl": "sl"}},
                 reduce_only=True,
             )
