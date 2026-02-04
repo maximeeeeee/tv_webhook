@@ -11,52 +11,30 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
-# NOTE: If you get "ModuleNotFoundError: eth_account", add "eth-account" to requirements.txt.
 from eth_account import Account
 
 app = FastAPI()
 
-# ===============================
-# TradingView security
-# ===============================
 TV_WEBHOOK_TOKEN = os.getenv("TV_WEBHOOK_TOKEN", "CHANGE_ME")
 
-# ===============================
-# Hyperliquid credentials
-# ===============================
 HL_ACCOUNT_ADDRESS = os.getenv("HL_ACCOUNT_ADDRESS", "")
 HL_SECRET_KEY = os.getenv("HL_SECRET_KEY", "")
-
-# Mainnet by default
 HL_BASE_URL = os.getenv("HL_BASE_URL", constants.MAINNET_API_URL)
 
-# LIVE / SAFE MODE
 HL_LIVE_TRADING = os.getenv("HL_LIVE_TRADING", "false").lower() == "true"
+HL_SLIPPAGE = os.getenv("HL_SLIPPAGE", "0.01")
 
-# Market slippage tolerance (used for market-style IOC pricing)
-HL_SLIPPAGE = os.getenv("HL_SLIPPAGE", "0.01")  # 1% default
-
-# Skip rules
 TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 
-# ===============================
-# Lazy init (IMPORTANT)
-# Avoid API calls at import time to prevent Render crash on 429
-# ===============================
 _info = None
 _exchange = None
 
-# ===============================
-# Simple idempotency (prevents TV retry duplicates)
-# In-memory dedup (single instance). For multi-instance, use Redis.
-# ===============================
-_seen = {}  # tv_order_id -> ts
-DEDUP_TTL = 60  # seconds
+_seen = {}
+DEDUP_TTL = 60
 
 
 def seen_recently(k: str) -> bool:
     now = time()
-    # cleanup
     for key, ts in list(_seen.items()):
         if now - ts > DEDUP_TTL:
             _seen.pop(key, None)
@@ -69,10 +47,6 @@ def seen_recently(k: str) -> bool:
 
 
 def get_hl_clients():
-    """
-    Create Info/Exchange only when needed (when /tv is hit).
-    Prevents startup crash due to transient 429 rate limits.
-    """
     global _info, _exchange
 
     if not HL_ACCOUNT_ADDRESS or not HL_SECRET_KEY:
@@ -86,8 +60,6 @@ def get_hl_clients():
 
     if _exchange is None:
         wallet = Account.from_key(HL_SECRET_KEY)
-
-        # Support multiple SDK signatures
         try:
             _exchange = Exchange(wallet=wallet, base_url=HL_BASE_URL, account_address=HL_ACCOUNT_ADDRESS)
         except TypeError:
@@ -99,9 +71,6 @@ def get_hl_clients():
     return _info, _exchange
 
 
-# ===============================
-# Helpers
-# ===============================
 def clean(v):
     if v is None:
         return None
@@ -128,23 +97,14 @@ def to_decimal(v):
 
 
 def normalize_tv_symbol_to_hl(symbol: str) -> str:
-    """
-    TradingView sends symbols like BTCUSDT / BTCUSDT.P / BINANCE:BTCUSDT etc.
-    Hyperliquid perp "coin" is usually BTC / ETH / etc.
-    """
     s = str(symbol).strip().upper()
-
-    # Handle prefixes like BINANCE:BTCUSDT
     if ":" in s:
         s = s.split(":")[-1]
-
     for suf in [".P", "PERP", "-PERP", "_PERP"]:
         if s.endswith(suf):
             s = s[: -len(suf)]
-
     if s.endswith("USDT") and len(s) > 4:
         s = s[:-4]
-
     return s
 
 
@@ -154,9 +114,6 @@ def is_rate_limited_error(e: Exception) -> bool:
 
 
 def log_exception(prefix: str, e: Exception):
-    """
-    Bitget-style logging: prints full error + full traceback in Render logs.
-    """
     print(f"\n{prefix}")
     print(str(e))
     print("\n--- TRACEBACK ---")
@@ -164,11 +121,8 @@ def log_exception(prefix: str, e: Exception):
     print("--- END TRACEBACK ---\n")
 
 
-# ===============================
-# Meta caching (reduce calls, lower 429 risk)
-# ===============================
 _meta_cache = {"ts": 0, "data": None}
-META_TTL_SEC = 300  # 5 minutes
+META_TTL_SEC = 300
 
 
 def get_meta_cached(info: Info):
@@ -179,13 +133,7 @@ def get_meta_cached(info: Info):
     return _meta_cache["data"]
 
 
-# ===============================
-# Tick / Step handling
-# ===============================
 def round_to_step(x: Decimal, step: Decimal) -> Decimal:
-    """
-    Round DOWN to a valid tick/step size using Decimal arithmetic.
-    """
     if step <= 0:
         return x
     n = (x / step).to_integral_value(rounding="ROUND_FLOOR")
@@ -193,10 +141,6 @@ def round_to_step(x: Decimal, step: Decimal) -> Decimal:
 
 
 def infer_px_step_from_l2(info: Info, coin: str) -> Optional[Decimal]:
-    """
-    Infer tick size from L2 snapshot by taking the minimum positive difference
-    between adjacent price levels. Works even if meta() parsing fails.
-    """
     try:
         snap = info.l2_snapshot(coin)
         levels = snap.get("levels", [])
@@ -206,7 +150,6 @@ def infer_px_step_from_l2(info: Info, coin: str) -> Optional[Decimal]:
         def extract_prices(side_levels):
             prices = []
             for lvl in side_levels:
-                # Handle both [px, sz] and {"px": ..., "sz": ...}
                 if isinstance(lvl, (list, tuple)) and len(lvl) >= 1:
                     prices.append(Decimal(str(lvl[0])))
                 elif isinstance(lvl, dict) and "px" in lvl:
@@ -237,16 +180,9 @@ def infer_px_step_from_l2(info: Info, coin: str) -> Optional[Decimal]:
 
 
 def get_px_step(info: Info, coin: str) -> Decimal:
-    """
-    Return price tick size for coin:
-    1) meta() pxStep or pxDecimals
-    2) infer from L2 orderbook
-    3) fallback to 1 (safe for integer books like BTC)
-    """
     try:
         meta = get_meta_cached(info)
         universe = meta.get("universe", [])
-
         for a in universe:
             if str(a.get("name", "")).upper() == coin.upper():
                 if a.get("pxStep") is not None:
@@ -258,9 +194,7 @@ def get_px_step(info: Info, coin: str) -> Decimal:
                     step = Decimal("1") / (Decimal("10") ** d)
                     print(f"✅ pxStep from meta(pxDecimals): coin={coin} pxStep={step}")
                     return step
-
         print(f"⚠️ pxStep NOT FOUND in meta() for coin={coin}. Trying L2 inference...")
-
     except Exception as e:
         print("⚠️ meta() pxStep lookup failed:", e)
 
@@ -274,10 +208,6 @@ def get_px_step(info: Info, coin: str) -> Decimal:
 
 
 def get_sz_step(info: Info, coin: str) -> Decimal:
-    """
-    Return the size step (lot step) for the given coin.
-    If szStep exists, use it. Else derive from szDecimals.
-    """
     try:
         meta = get_meta_cached(info)
         universe = meta.get("universe", [])
@@ -295,13 +225,10 @@ def get_sz_step(info: Info, coin: str) -> Decimal:
     except Exception as e:
         print("⚠️ Could not fetch szStep from meta:", e)
 
-    return Decimal("0.001")  # conservative fallback
+    return Decimal("0.001")
 
 
 def tick_ok(px: Decimal, step: Decimal) -> bool:
-    """
-    True if px is divisible by step.
-    """
     if step <= 0:
         return True
     q = px / step
@@ -309,10 +236,6 @@ def tick_ok(px: Decimal, step: Decimal) -> bool:
 
 
 def order_ok_or_error(main_result: dict):
-    """
-    Hyperliquid often returns HTTP 200 with embedded order errors.
-    Return error string if present, otherwise None.
-    """
     try:
         statuses = main_result.get("response", {}).get("data", {}).get("statuses", [])
         for s in statuses:
@@ -325,9 +248,6 @@ def order_ok_or_error(main_result: dict):
     return None
 
 
-# ===============================
-# Webhook
-# ===============================
 @app.post("/tv")
 async def tv_webhook(req: Request):
     print("\n✅✅✅ /tv HIT (request received) ✅✅✅")
@@ -336,7 +256,6 @@ async def tv_webhook(req: Request):
     raw = await req.body()
     text = raw.decode("utf-8", errors="replace").strip()
 
-    # handle body being double-quoted JSON string
     if text.startswith('"') and text.endswith('"'):
         text = text[1:-1].replace('\\"', '"')
 
@@ -358,7 +277,6 @@ async def tv_webhook(req: Request):
     tv_order_id = str(data.get("tv_order_id", "")).strip()
     tv_comment = str(data.get("tv_comment", "")).strip()
 
-    # Idempotency: ignore duplicates from retries
     if seen_recently(tv_order_id):
         print(f"⏭️ DUPLICATE webhook ignored: {tv_order_id}")
         return {"ok": True, "mode": "deduped", "tv_order_id": tv_order_id}
@@ -397,7 +315,6 @@ async def tv_webhook(req: Request):
         f"reduce_only={reduce_only_bool} tp_trigger={tp_trigger} sl_trigger={sl_trigger} limit_price={limit_price}"
     )
 
-    # --- SAFE MODE ---
     if not HL_LIVE_TRADING:
         print("⚠️ SAFE MODE — not sent")
         return {
@@ -414,14 +331,12 @@ async def tv_webhook(req: Request):
             "tv_comment": tv_comment,
         }
 
-    # --- Lazy init clients (only now) ---
     try:
         info, exchange = get_hl_clients()
     except Exception as e:
         log_exception("❌ HYPERLIQUID CLIENT INIT FAILED ❌", e)
         raise HTTPException(status_code=500, detail=f"Hyperliquid client init failed: {e}")
 
-    # --- Enforce size step (lot step) ---
     try:
         sz_step = get_sz_step(info, coin)
         sz_rounded = round_to_step(sz, sz_step)
@@ -434,16 +349,13 @@ async def tv_webhook(req: Request):
         raise
     except Exception as e:
         log_exception("⚠️ SIZE STEP CHECK WARNING ⚠️", e)
-        # Continue with original sz if meta fails; HL may still accept it.
 
-    # --- Get pxStep (robust: meta -> L2 inference -> fallback) ---
     px_step = get_px_step(info, coin)
 
-    def round_trigger_px_str(v: Decimal) -> str:
-        # Triggers are passed as strings (works fine). We still align them to tick.
-        return str(round_to_step(Decimal(str(v)), px_step))
+    # ✅ FIX: Hyperliquid SDK expects triggerPx as FLOAT (not str)
+    def round_trigger_px_float(v: Decimal) -> float:
+        return float(round_to_step(Decimal(str(v)), px_step))
 
-    # --- Place main order ---
     try:
         if order_type == "market":
             slippage = Decimal(str(HL_SLIPPAGE))
@@ -453,7 +365,6 @@ async def tv_webhook(req: Request):
                 raise HTTPException(status_code=400, detail=f"Unknown coin for mids: {coin}")
 
             mid = Decimal(str(mids[coin]))
-
             px_raw = mid * (Decimal("1") + slippage) if is_buy else mid * (Decimal("1") - slippage)
             px = round_to_step(px_raw, px_step)
 
@@ -463,7 +374,6 @@ async def tv_webhook(req: Request):
             if not tick_ok(px, px_step):
                 raise HTTPException(status_code=500, detail=f"Computed px is not divisible by tick: px={px} step={px_step}")
 
-            # ✅ IMPORTANT: HL SDK expects limit_px as FLOAT, not string
             main_result = exchange.order(
                 coin,
                 is_buy,
@@ -485,7 +395,6 @@ async def tv_webhook(req: Request):
             if not tick_ok(lp, px_step):
                 raise HTTPException(status_code=500, detail=f"Limit price not divisible by tick: lp={lp} step={px_step}")
 
-            # ✅ IMPORTANT: HL SDK expects limit_px as FLOAT, not string
             main_result = exchange.order(
                 coin,
                 is_buy,
@@ -500,17 +409,9 @@ async def tv_webhook(req: Request):
 
     except Exception as e:
         log_exception("❌❌❌ HYPERLIQUID LIVE ORDER FAILED ❌❌❌", e)
-
         if is_rate_limited_error(e):
-            raise HTTPException(
-                status_code=503,
-                detail="Hyperliquid rate limited (429). Retry in a few seconds.",
-            )
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Hyperliquid order failed: {e}",
-        )
+            raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429). Retry in a few seconds.")
+        raise HTTPException(status_code=500, detail=f"Hyperliquid order failed: {e}")
 
     print("\n=== HL MAIN ORDER RESPONSE ===")
     print(main_result)
@@ -521,7 +422,6 @@ async def tv_webhook(req: Request):
         print(embedded_err)
         raise HTTPException(status_code=500, detail=f"Hyperliquid order error: {embedded_err}")
 
-    # --- Optional TP/SL trigger orders ---
     tpsl_results = []
     tpsl_is_buy = not is_buy
 
@@ -532,7 +432,7 @@ async def tv_webhook(req: Request):
                 tpsl_is_buy,
                 float(sz),
                 0.0,
-                {"trigger": {"isMarket": True, "triggerPx": round_trigger_px_str(tp_trigger), "tpsl": "tp"}},
+                {"trigger": {"isMarket": True, "triggerPx": round_trigger_px_float(tp_trigger), "tpsl": "tp"}},
                 reduce_only=True,
             )
             tpsl_results.append({"tp": tp_res})
@@ -543,7 +443,7 @@ async def tv_webhook(req: Request):
                 tpsl_is_buy,
                 float(sz),
                 0.0,
-                {"trigger": {"isMarket": True, "triggerPx": round_trigger_px_str(sl_trigger), "tpsl": "sl"}},
+                {"trigger": {"isMarket": True, "triggerPx": round_trigger_px_float(sl_trigger), "tpsl": "sl"}},
                 reduce_only=True,
             )
             tpsl_results.append({"sl": sl_res})
