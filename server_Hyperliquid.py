@@ -36,6 +36,10 @@ HL_LIVE_TRADING = os.getenv("HL_LIVE_TRADING", "false").lower() == "true"
 # Market slippage tolerance (used for market-style IOC pricing)
 HL_SLIPPAGE = os.getenv("HL_SLIPPAGE", "0.01")  # 1% default
 
+# Trigger-market "guard" slippage (used for TP/SL trigger orders)
+# Make it generous so you don't miss fills on fast moves.
+HL_TRIGGER_SLIPPAGE = os.getenv("HL_TRIGGER_SLIPPAGE", "0.10")  # 10% default
+
 # Skip rules
 TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 
@@ -206,7 +210,6 @@ def infer_px_step_from_l2(info: Info, coin: str) -> Optional[Decimal]:
         def extract_prices(side_levels):
             prices = []
             for lvl in side_levels:
-                # Handle both [px, sz] and {"px": ..., "sz": ...}
                 if isinstance(lvl, (list, tuple)) and len(lvl) >= 1:
                     prices.append(Decimal(str(lvl[0])))
                 elif isinstance(lvl, dict) and "px" in lvl:
@@ -299,9 +302,6 @@ def get_sz_step(info: Info, coin: str) -> Decimal:
 
 
 def tick_ok(px: Decimal, step: Decimal) -> bool:
-    """
-    True if px is divisible by step.
-    """
     if step <= 0:
         return True
     q = px / step
@@ -309,10 +309,6 @@ def tick_ok(px: Decimal, step: Decimal) -> bool:
 
 
 def order_ok_or_error(main_result: dict):
-    """
-    Hyperliquid often returns HTTP 200 with embedded order errors.
-    Return error string if present, otherwise None.
-    """
     try:
         statuses = main_result.get("response", {}).get("data", {}).get("statuses", [])
         for s in statuses:
@@ -326,9 +322,6 @@ def order_ok_or_error(main_result: dict):
 
 
 def status_has_key(main_result: dict, key: str) -> bool:
-    """
-    True if HL response statuses contains a dict with the given key (e.g. 'resting', 'filled').
-    """
     try:
         statuses = main_result.get("response", {}).get("data", {}).get("statuses", [])
         return any(isinstance(s, dict) and key in s for s in statuses)
@@ -347,7 +340,6 @@ async def tv_webhook(req: Request):
     raw = await req.body()
     text = raw.decode("utf-8", errors="replace").strip()
 
-    # handle body being double-quoted JSON string
     if text.startswith('"') and text.endswith('"'):
         text = text[1:-1].replace('\\"', '"')
 
@@ -369,7 +361,6 @@ async def tv_webhook(req: Request):
     tv_order_id = str(data.get("tv_order_id", "")).strip()
     tv_comment = str(data.get("tv_comment", "")).strip()
 
-    # Idempotency: ignore duplicates from retries
     if seen_recently(tv_order_id):
         print(f"⏭️ DUPLICATE webhook ignored: {tv_order_id}")
         return {"ok": True, "mode": "deduped", "tv_order_id": tv_order_id}
@@ -408,7 +399,6 @@ async def tv_webhook(req: Request):
         f"reduce_only={reduce_only_bool} tp_trigger={tp_trigger} sl_trigger={sl_trigger} limit_price={limit_price}"
     )
 
-    # --- SAFE MODE ---
     if not HL_LIVE_TRADING:
         print("⚠️ SAFE MODE — not sent")
         return {
@@ -425,14 +415,13 @@ async def tv_webhook(req: Request):
             "tv_comment": tv_comment,
         }
 
-    # --- Lazy init clients (only now) ---
     try:
         info, exchange = get_hl_clients()
     except Exception as e:
         log_exception("❌ HYPERLIQUID CLIENT INIT FAILED ❌", e)
         raise HTTPException(status_code=500, detail=f"Hyperliquid client init failed: {e}")
 
-    # --- Enforce size step (lot step) ---
+    # Size step
     try:
         sz_step = get_sz_step(info, coin)
         sz_rounded = round_to_step(sz, sz_step)
@@ -445,16 +434,35 @@ async def tv_webhook(req: Request):
         raise
     except Exception as e:
         log_exception("⚠️ SIZE STEP CHECK WARNING ⚠️", e)
-        # Continue with original sz if meta fails; HL may still accept it.
 
-    # --- Get pxStep (robust: meta -> L2 inference -> fallback) ---
+    # Tick step
     px_step = get_px_step(info, coin)
 
-    # ✅ HL SDK expects triggerPx as FLOAT, not string
     def round_trigger_px_float(v: Decimal) -> float:
         return float(round_to_step(Decimal(str(v)), px_step))
 
-    # --- Place main order ---
+    def trigger_guard_px_float(trigger_px: Decimal, is_buy_side: bool) -> float:
+        """
+        HL SDK still requires a valid 'price' field for trigger orders.
+        For trigger market orders, set a wide guard price around the triggerPx.
+        """
+        slip = Decimal(str(HL_TRIGGER_SLIPPAGE))
+        ref = Decimal(str(trigger_px))
+        guard = ref * (Decimal("1") + slip) if is_buy_side else ref * (Decimal("1") - slip)
+
+        # avoid non-positive
+        if guard <= 0:
+            guard = px_step if px_step > 0 else Decimal("1")
+
+        guard = round_to_step(guard, px_step)
+
+        # if rounding pushed to 0, bump to 1 tick
+        if guard <= 0:
+            guard = px_step if px_step > 0 else Decimal("1")
+
+        return float(guard)
+
+    # MAIN ORDER
     try:
         if order_type == "market":
             slippage = Decimal(str(HL_SLIPPAGE))
@@ -464,7 +472,6 @@ async def tv_webhook(req: Request):
                 raise HTTPException(status_code=400, detail=f"Unknown coin for mids: {coin}")
 
             mid = Decimal(str(mids[coin]))
-
             px_raw = mid * (Decimal("1") + slippage) if is_buy else mid * (Decimal("1") - slippage)
             px = round_to_step(px_raw, px_step)
 
@@ -509,17 +516,9 @@ async def tv_webhook(req: Request):
 
     except Exception as e:
         log_exception("❌❌❌ HYPERLIQUID LIVE ORDER FAILED ❌❌❌", e)
-
         if is_rate_limited_error(e):
-            raise HTTPException(
-                status_code=503,
-                detail="Hyperliquid rate limited (429). Retry in a few seconds.",
-            )
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Hyperliquid order failed: {e}",
-        )
+            raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429). Retry in a few seconds.")
+        raise HTTPException(status_code=500, detail=f"Hyperliquid order failed: {e}")
 
     print("\n=== HL MAIN ORDER RESPONSE ===")
     print(main_result)
@@ -530,25 +529,27 @@ async def tv_webhook(req: Request):
         print(embedded_err)
         raise HTTPException(status_code=500, detail=f"Hyperliquid order error: {embedded_err}")
 
-    # Decide how to place TP/SL immediately:
-    # - If entry is resting (not filled yet), place TP/SL with reduce_only=False (HL UI style)
-    # - If entry is filled, place with reduce_only=True (safest)
     entry_is_resting = status_has_key(main_result, "resting")
     entry_is_filled = status_has_key(main_result, "filled")
     tpsl_reduce_only = False if entry_is_resting else True
     print(f"ℹ️ Entry status: resting={entry_is_resting} filled={entry_is_filled} -> tpsl_reduce_only={tpsl_reduce_only}")
 
-    # --- Optional TP/SL trigger orders ---
+    # TP/SL trigger orders
     tpsl_results = []
-    tpsl_is_buy = not is_buy
+    tpsl_is_buy = not is_buy  # opposite side to exit
 
     try:
         if tp_trigger:
+            tp_trigger_rounded = Decimal(str(round_to_step(Decimal(str(tp_trigger)), px_step)))
+            tp_px = trigger_guard_px_float(tp_trigger_rounded, is_buy_side=tpsl_is_buy)
+
+            print(f"=== TP DEBUG === trigger_raw={tp_trigger} trigger_rounded={tp_trigger_rounded} guard_px={tp_px} px_step={px_step}")
+
             tp_res = exchange.order(
                 coin,
                 tpsl_is_buy,
                 float(sz),
-                0.0,
+                float(tp_px),
                 {"trigger": {"isMarket": True, "triggerPx": round_trigger_px_float(tp_trigger), "tpsl": "tp"}},
                 reduce_only=tpsl_reduce_only,
             )
@@ -560,11 +561,16 @@ async def tv_webhook(req: Request):
             tpsl_results.append({"tp": tp_res, "tp_err": tp_err, "reduce_only": tpsl_reduce_only})
 
         if sl_trigger:
+            sl_trigger_rounded = Decimal(str(round_to_step(Decimal(str(sl_trigger)), px_step)))
+            sl_px = trigger_guard_px_float(sl_trigger_rounded, is_buy_side=tpsl_is_buy)
+
+            print(f"=== SL DEBUG === trigger_raw={sl_trigger} trigger_rounded={sl_trigger_rounded} guard_px={sl_px} px_step={px_step}")
+
             sl_res = exchange.order(
                 coin,
                 tpsl_is_buy,
                 float(sz),
-                0.0,
+                float(sl_px),
                 {"trigger": {"isMarket": True, "triggerPx": round_trigger_px_float(sl_trigger), "tpsl": "sl"}},
                 reduce_only=tpsl_reduce_only,
             )
