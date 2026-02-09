@@ -39,17 +39,15 @@ HL_SLIPPAGE = Decimal(os.getenv("HL_SLIPPAGE", "0.01"))  # 1% default
 TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 
 # ===============================
-# HARD-CODED STEPS (to avoid meta/info calls)
+# HARD-CODED STEPS (avoid meta/info calls for steps)
 # ===============================
-# Your confirmed BTC rules:
-# - Minimal size increment: 0.00001 BTC
-# - Price increment: 1 (no decimals)
 ASSET_STEPS = {
     "BTC": {"sz_step": Decimal("0.00001"), "px_step": Decimal("1")},
 }
 
 # ===============================
-# Lazy init Exchange (NO Info init)
+# Lazy init Exchange (but Exchange() may still call Info() internally)
+# We add retry/backoff to survive 429 during init.
 # ===============================
 _exchange = None
 
@@ -125,8 +123,15 @@ def round_to_step(x: Decimal, step: Decimal) -> Decimal:
     return n * step
 
 
-def get_exchange() -> Exchange:
+def get_exchange_with_retry(max_attempts: int = 6) -> Exchange:
+    """
+    Build Exchange with retry/backoff because the SDK may call Info()/spot_meta() on init,
+    which can return 429 (rate limit), especially from Render IP ranges.
+    """
     global _exchange
+
+    if _exchange is not None:
+        return _exchange
 
     if not HL_ACCOUNT_ADDRESS or not HL_SECRET_KEY:
         raise HTTPException(
@@ -134,18 +139,42 @@ def get_exchange() -> Exchange:
             detail="Missing HL_ACCOUNT_ADDRESS or HL_SECRET_KEY in env vars",
         )
 
-    if _exchange is None:
-        wallet = Account.from_key(HL_SECRET_KEY)
-        # Support multiple SDK signatures
-        try:
-            _exchange = Exchange(wallet=wallet, base_url=HL_BASE_URL, account_address=HL_ACCOUNT_ADDRESS)
-        except TypeError:
-            try:
-                _exchange = Exchange(wallet, HL_BASE_URL, HL_ACCOUNT_ADDRESS)
-            except TypeError:
-                _exchange = Exchange(HL_ACCOUNT_ADDRESS, HL_SECRET_KEY, base_url=HL_BASE_URL)
+    wallet = Account.from_key(HL_SECRET_KEY)
 
-    return _exchange
+    backoff = 1
+    last_err = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # Support multiple SDK signatures
+            try:
+                ex = Exchange(wallet=wallet, base_url=HL_BASE_URL, account_address=HL_ACCOUNT_ADDRESS)
+            except TypeError:
+                try:
+                    ex = Exchange(wallet, HL_BASE_URL, HL_ACCOUNT_ADDRESS)
+                except TypeError:
+                    ex = Exchange(HL_ACCOUNT_ADDRESS, HL_SECRET_KEY, base_url=HL_BASE_URL)
+
+            _exchange = ex
+            print("✅ Exchange initialized successfully")
+            return _exchange
+
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+
+            # detect rate limiting
+            if "429" in msg:
+                print(f"⚠️ Exchange init hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
+                sleep(backoff)
+                backoff = min(backoff * 2, 12)
+                continue
+
+            # not a 429 -> fail fast
+            log_exception("❌ Exchange init failed (non-429) ❌", e)
+            raise HTTPException(status_code=500, detail=f"Exchange init failed: {e}")
+
+    raise HTTPException(status_code=503, detail=f"Exchange init failed after retries (last_err={last_err})")
 
 
 def fetch_all_mids_with_retry(max_attempts: int = 5):
@@ -252,10 +281,11 @@ async def tv_webhook(req: Request):
         print(f"ℹ️ Size rounded: raw_sz={sz} sz_step={sz_step} sz_rounded={sz_rounded}")
     sz = sz_rounded
 
-    exchange = get_exchange()
-
     if order_type != "market":
         raise HTTPException(status_code=400, detail="This lightweight version supports only market orders for now.")
+
+    # Build Exchange with retry/backoff (prevents random 500 on 429 during init)
+    exchange = get_exchange_with_retry()
 
     # Get mid price (one /info call) then create IOC limit px with slippage
     mids = fetch_all_mids_with_retry()
@@ -270,17 +300,19 @@ async def tv_webhook(req: Request):
     print(f"\n=== PRICE DEBUG === coin={coin} mid={mid} px_raw={px_raw} px_step={px_step} px_rounded={px}")
 
     try:
-        # IMPORTANT: always pass order_type positional arg
         main_result = exchange.order(
             coin,
             is_buy,
             float(sz),
             float(px),
-            {"limit": {"tif": "Ioc"}},
+            {"limit": {"tif": "Ioc"}},  # order_type positional arg
             reduce_only=reduce_only_bool,
         )
     except Exception as e:
+        msg = str(e)
         log_exception("❌❌❌ HYPERLIQUID LIVE ORDER FAILED ❌❌❌", e)
+        if "429" in msg:
+            raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429). TradingView will retry.")
         raise HTTPException(status_code=500, detail=f"Hyperliquid order failed: {e}")
 
     print("\n=== HL MAIN ORDER RESPONSE ===")
