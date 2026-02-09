@@ -2,7 +2,7 @@ import os
 import json
 import traceback
 from decimal import Decimal, InvalidOperation
-from time import time
+from time import time, sleep
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException
@@ -40,6 +40,10 @@ HL_SLIPPAGE = os.getenv("HL_SLIPPAGE", "0.01")  # 1% default
 # Make it generous so you don't miss fills on fast moves.
 HL_TRIGGER_SLIPPAGE = os.getenv("HL_TRIGGER_SLIPPAGE", "0.10")  # 10% default
 
+# Retry settings for HL Info init (meta() is called inside Info())
+HL_INFO_INIT_RETRIES = int(os.getenv("HL_INFO_INIT_RETRIES", "5"))
+HL_INFO_INIT_MAX_SLEEP = int(os.getenv("HL_INFO_INIT_MAX_SLEEP", "10"))
+
 # Skip rules
 TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 
@@ -72,10 +76,15 @@ def seen_recently(k: str) -> bool:
     return False
 
 
+def is_429(e: Exception) -> bool:
+    s = str(e)
+    return ("429" in s) or ("ClientError: (429" in s)
+
+
 def get_hl_clients():
     """
     Create Info/Exchange only when needed (when /tv is hit).
-    Prevents startup crash due to transient 429 rate limits.
+    Adds retry/backoff because Info() calls meta() during init and can 429.
     """
     global _info, _exchange
 
@@ -85,9 +94,29 @@ def get_hl_clients():
             detail="Missing HL_ACCOUNT_ADDRESS or HL_SECRET_KEY in Render env vars",
         )
 
+    # Info() calls meta() in __init__, so protect it with retry/backoff
     if _info is None:
-        _info = Info(HL_BASE_URL, skip_ws=True)
+        last_err = None
+        for attempt in range(1, HL_INFO_INIT_RETRIES + 1):
+            try:
+                _info = Info(HL_BASE_URL, skip_ws=True)
+                break
+            except Exception as e:
+                last_err = e
+                if is_429(e):
+                    wait = min(2 ** (attempt - 1), HL_INFO_INIT_MAX_SLEEP)  # 1,2,4,8,10...
+                    print(f"⚠️ HL Info init hit 429 (attempt {attempt}/{HL_INFO_INIT_RETRIES}). Backing off {wait}s...")
+                    sleep(wait)
+                    continue
+                raise
 
+        if _info is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Hyperliquid rate limited (429) during Info init: {last_err}",
+            )
+
+    # Exchange construction should not require network
     if _exchange is None:
         wallet = Account.from_key(HL_SECRET_KEY)
 
@@ -415,10 +444,15 @@ async def tv_webhook(req: Request):
             "tv_comment": tv_comment,
         }
 
+    # ✅ Now resilient to 429 at Info init
     try:
         info, exchange = get_hl_clients()
+    except HTTPException:
+        raise
     except Exception as e:
         log_exception("❌ HYPERLIQUID CLIENT INIT FAILED ❌", e)
+        if is_rate_limited_error(e):
+            raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429). Retry in a few seconds.")
         raise HTTPException(status_code=500, detail=f"Hyperliquid client init failed: {e}")
 
     # Size step
@@ -450,13 +484,11 @@ async def tv_webhook(req: Request):
         ref = Decimal(str(trigger_px))
         guard = ref * (Decimal("1") + slip) if is_buy_side else ref * (Decimal("1") - slip)
 
-        # avoid non-positive
         if guard <= 0:
             guard = px_step if px_step > 0 else Decimal("1")
 
         guard = round_to_step(guard, px_step)
 
-        # if rounding pushed to 0, bump to 1 tick
         if guard <= 0:
             guard = px_step if px_step > 0 else Decimal("1")
 
