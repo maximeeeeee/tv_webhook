@@ -40,7 +40,7 @@ HL_SLIPPAGE = os.getenv("HL_SLIPPAGE", "0.01")  # 1% default
 # Make it generous so you don't miss fills on fast moves.
 HL_TRIGGER_SLIPPAGE = os.getenv("HL_TRIGGER_SLIPPAGE", "0.10")  # 10% default
 
-# Retry settings for HL Info init (meta() is called inside Info())
+# Retry settings for HL Info/Exchange init (Info/meta/spotMeta can 429)
 HL_INFO_INIT_RETRIES = int(os.getenv("HL_INFO_INIT_RETRIES", "5"))
 HL_INFO_INIT_MAX_SLEEP = int(os.getenv("HL_INFO_INIT_MAX_SLEEP", "10"))
 
@@ -53,6 +53,7 @@ TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 # ===============================
 _info = None
 _exchange = None
+_spot_meta = None  # ✅ cache spot_meta to avoid Exchange() re-fetching it
 
 # ===============================
 # Simple idempotency (prevents TV retry duplicates)
@@ -64,7 +65,6 @@ DEDUP_TTL = 60  # seconds
 
 def seen_recently(k: str) -> bool:
     now = time()
-    # cleanup
     for key, ts in list(_seen.items()):
         if now - ts > DEDUP_TTL:
             _seen.pop(key, None)
@@ -81,12 +81,17 @@ def is_429(e: Exception) -> bool:
     return ("429" in s) or ("ClientError: (429" in s)
 
 
+def _backoff_sleep(attempt: int) -> int:
+    return min(2 ** (attempt - 1), HL_INFO_INIT_MAX_SLEEP)
+
+
 def get_hl_clients():
     """
     Create Info/Exchange only when needed (when /tv is hit).
-    Adds retry/backoff because Info() calls meta() during init and can 429.
+    Adds retry/backoff because BOTH Info() and Exchange() can call /info and hit 429.
+    Also pre-fetches meta + spot_meta to reduce calls.
     """
-    global _info, _exchange
+    global _info, _exchange, _spot_meta
 
     if not HL_ACCOUNT_ADDRESS or not HL_SECRET_KEY:
         raise HTTPException(
@@ -94,7 +99,7 @@ def get_hl_clients():
             detail="Missing HL_ACCOUNT_ADDRESS or HL_SECRET_KEY in Render env vars",
         )
 
-    # Info() calls meta() in __init__, so protect it with retry/backoff
+    # 1) Init Info with retry/backoff (Info() calls meta() inside __init__)
     if _info is None:
         last_err = None
         for attempt in range(1, HL_INFO_INIT_RETRIES + 1):
@@ -104,30 +109,84 @@ def get_hl_clients():
             except Exception as e:
                 last_err = e
                 if is_429(e):
-                    wait = min(2 ** (attempt - 1), HL_INFO_INIT_MAX_SLEEP)  # 1,2,4,8,10...
+                    wait = _backoff_sleep(attempt)
                     print(f"⚠️ HL Info init hit 429 (attempt {attempt}/{HL_INFO_INIT_RETRIES}). Backing off {wait}s...")
                     sleep(wait)
                     continue
                 raise
-
         if _info is None:
             raise HTTPException(
                 status_code=503,
                 detail=f"Hyperliquid rate limited (429) during Info init: {last_err}",
             )
 
-    # Exchange construction should not require network
+    # 2) Pre-fetch meta (cached) with retry/backoff (meta() can also 429)
+    meta = None
+    last_err = None
+    for attempt in range(1, HL_INFO_INIT_RETRIES + 1):
+        try:
+            meta = get_meta_cached(_info)
+            break
+        except Exception as e:
+            last_err = e
+            if is_429(e):
+                wait = _backoff_sleep(attempt)
+                print(f"⚠️ HL meta() hit 429 (attempt {attempt}/{HL_INFO_INIT_RETRIES}). Backing off {wait}s...")
+                sleep(wait)
+                continue
+            raise
+    if meta is None:
+        raise HTTPException(status_code=503, detail=f"Hyperliquid rate limited (429) during meta(): {last_err}")
+
+    # 3) Pre-fetch spot_meta once with retry/backoff (Exchange init often calls this)
+    if _spot_meta is None:
+        last_err = None
+        for attempt in range(1, HL_INFO_INIT_RETRIES + 1):
+            try:
+                _spot_meta = _info.spot_meta()
+                break
+            except Exception as e:
+                last_err = e
+                if is_429(e):
+                    wait = _backoff_sleep(attempt)
+                    print(f"⚠️ HL spot_meta() hit 429 (attempt {attempt}/{HL_INFO_INIT_RETRIES}). Backing off {wait}s...")
+                    sleep(wait)
+                    continue
+                raise
+        if _spot_meta is None:
+            raise HTTPException(status_code=503, detail=f"Hyperliquid rate limited (429) during spot_meta(): {last_err}")
+
+    # 4) Init Exchange with retry/backoff too (Exchange() can call /info internally)
     if _exchange is None:
         wallet = Account.from_key(HL_SECRET_KEY)
 
-        # Support multiple SDK signatures
-        try:
-            _exchange = Exchange(wallet=wallet, base_url=HL_BASE_URL, account_address=HL_ACCOUNT_ADDRESS)
-        except TypeError:
+        last_err = None
+        for attempt in range(1, HL_INFO_INIT_RETRIES + 1):
             try:
-                _exchange = Exchange(wallet, HL_BASE_URL, HL_ACCOUNT_ADDRESS)
-            except TypeError:
-                _exchange = Exchange(HL_ACCOUNT_ADDRESS, HL_SECRET_KEY, base_url=HL_BASE_URL)
+                # Newer SDK signature: pass meta + spot_meta to reduce /info calls
+                try:
+                    _exchange = Exchange(
+                        wallet=wallet,
+                        base_url=HL_BASE_URL,
+                        account_address=HL_ACCOUNT_ADDRESS,
+                        meta=meta,
+                        spot_meta=_spot_meta,
+                    )
+                except TypeError:
+                    # Older SDK signature: still fine, but may do /info internally
+                    _exchange = Exchange(wallet=wallet, base_url=HL_BASE_URL, account_address=HL_ACCOUNT_ADDRESS)
+                break
+            except Exception as e:
+                last_err = e
+                if is_429(e):
+                    wait = _backoff_sleep(attempt)
+                    print(f"⚠️ HL Exchange init hit 429 (attempt {attempt}/{HL_INFO_INIT_RETRIES}). Backing off {wait}s...")
+                    sleep(wait)
+                    continue
+                raise
+
+        if _exchange is None:
+            raise HTTPException(status_code=503, detail=f"Hyperliquid rate limited (429) during Exchange init: {last_err}")
 
     return _info, _exchange
 
@@ -161,23 +220,14 @@ def to_decimal(v):
 
 
 def normalize_tv_symbol_to_hl(symbol: str) -> str:
-    """
-    TradingView sends symbols like BTCUSDT / BTCUSDT.P / BINANCE:BTCUSDT etc.
-    Hyperliquid perp "coin" is usually BTC / ETH / etc.
-    """
     s = str(symbol).strip().upper()
-
-    # Handle prefixes like BINANCE:BTCUSDT
     if ":" in s:
         s = s.split(":")[-1]
-
     for suf in [".P", "PERP", "-PERP", "_PERP"]:
         if s.endswith(suf):
             s = s[: -len(suf)]
-
     if s.endswith("USDT") and len(s) > 4:
         s = s[:-4]
-
     return s
 
 
@@ -187,9 +237,6 @@ def is_rate_limited_error(e: Exception) -> bool:
 
 
 def log_exception(prefix: str, e: Exception):
-    """
-    Bitget-style logging: prints full error + full traceback in Render logs.
-    """
     print(f"\n{prefix}")
     print(str(e))
     print("\n--- TRACEBACK ---")
@@ -216,9 +263,6 @@ def get_meta_cached(info: Info):
 # Tick / Step handling
 # ===============================
 def round_to_step(x: Decimal, step: Decimal) -> Decimal:
-    """
-    Round DOWN to a valid tick/step size using Decimal arithmetic.
-    """
     if step <= 0:
         return x
     n = (x / step).to_integral_value(rounding="ROUND_FLOOR")
@@ -226,10 +270,6 @@ def round_to_step(x: Decimal, step: Decimal) -> Decimal:
 
 
 def infer_px_step_from_l2(info: Info, coin: str) -> Optional[Decimal]:
-    """
-    Infer tick size from L2 snapshot by taking the minimum positive difference
-    between adjacent price levels. Works even if meta() parsing fails.
-    """
     try:
         snap = info.l2_snapshot(coin)
         levels = snap.get("levels", [])
@@ -269,16 +309,9 @@ def infer_px_step_from_l2(info: Info, coin: str) -> Optional[Decimal]:
 
 
 def get_px_step(info: Info, coin: str) -> Decimal:
-    """
-    Return price tick size for coin:
-    1) meta() pxStep or pxDecimals
-    2) infer from L2 orderbook
-    3) fallback to 1 (safe for integer books like BTC)
-    """
     try:
         meta = get_meta_cached(info)
         universe = meta.get("universe", [])
-
         for a in universe:
             if str(a.get("name", "")).upper() == coin.upper():
                 if a.get("pxStep") is not None:
@@ -290,9 +323,7 @@ def get_px_step(info: Info, coin: str) -> Decimal:
                     step = Decimal("1") / (Decimal("10") ** d)
                     print(f"✅ pxStep from meta(pxDecimals): coin={coin} pxStep={step}")
                     return step
-
         print(f"⚠️ pxStep NOT FOUND in meta() for coin={coin}. Trying L2 inference...")
-
     except Exception as e:
         print("⚠️ meta() pxStep lookup failed:", e)
 
@@ -306,10 +337,6 @@ def get_px_step(info: Info, coin: str) -> Decimal:
 
 
 def get_sz_step(info: Info, coin: str) -> Decimal:
-    """
-    Return the size step (lot step) for the given coin.
-    If szStep exists, use it. Else derive from szDecimals.
-    """
     try:
         meta = get_meta_cached(info)
         universe = meta.get("universe", [])
@@ -327,7 +354,7 @@ def get_sz_step(info: Info, coin: str) -> Decimal:
     except Exception as e:
         print("⚠️ Could not fetch szStep from meta:", e)
 
-    return Decimal("0.001")  # conservative fallback
+    return Decimal("0.001")
 
 
 def tick_ok(px: Decimal, step: Decimal) -> bool:
@@ -444,7 +471,6 @@ async def tv_webhook(req: Request):
             "tv_comment": tv_comment,
         }
 
-    # ✅ Now resilient to 429 at Info init
     try:
         info, exchange = get_hl_clients()
     except HTTPException:
@@ -476,10 +502,6 @@ async def tv_webhook(req: Request):
         return float(round_to_step(Decimal(str(v)), px_step))
 
     def trigger_guard_px_float(trigger_px: Decimal, is_buy_side: bool) -> float:
-        """
-        HL SDK still requires a valid 'price' field for trigger orders.
-        For trigger market orders, set a wide guard price around the triggerPx.
-        """
         slip = Decimal(str(HL_TRIGGER_SLIPPAGE))
         ref = Decimal(str(trigger_px))
         guard = ref * (Decimal("1") + slip) if is_buy_side else ref * (Decimal("1") - slip)
