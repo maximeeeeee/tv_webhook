@@ -1,8 +1,10 @@
 import os
 import json
 import traceback
+import hashlib
 from decimal import Decimal, InvalidOperation
 from time import time, sleep
+from typing import Optional, Tuple
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
@@ -39,22 +41,24 @@ HL_SLIPPAGE = Decimal(os.getenv("HL_SLIPPAGE", "0.01"))  # 1% default
 TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 
 # ===============================
-# HARD-CODED STEPS (avoid meta/info calls for steps)
+# HARD-CODED STEPS (to avoid meta/info calls)
 # ===============================
+# Your confirmed BTC rules:
+# - Minimal size increment: 0.00001 BTC
+# - Price increment: 1 (no decimals)
 ASSET_STEPS = {
     "BTC": {"sz_step": Decimal("0.00001"), "px_step": Decimal("1")},
 }
 
 # ===============================
-# Lazy init Exchange (but Exchange() may still call Info() internally)
-# We add retry/backoff to survive 429 during init.
+# Lazy init Exchange (SDK still calls /info internally on init => retry)
 # ===============================
-_exchange = None
+_exchange: Optional[Exchange] = None
 
 # ===============================
-# Simple idempotency (prevents TV retry duplicates)
+# Idempotency (prevents TV retry duplicates)
 # ===============================
-_seen = {}  # tv_order_id -> ts
+_seen = {}  # key -> ts
 DEDUP_TTL = 60  # seconds
 
 
@@ -123,15 +127,17 @@ def round_to_step(x: Decimal, step: Decimal) -> Decimal:
     return n * step
 
 
-def get_exchange_with_retry(max_attempts: int = 6) -> Exchange:
+def is_429(e: Exception) -> bool:
+    msg = str(e)
+    return "429" in msg or "rate" in msg.lower()
+
+
+def get_exchange(max_attempts: int = 5) -> Exchange:
     """
-    Build Exchange with retry/backoff because the SDK may call Info()/spot_meta() on init,
-    which can return 429 (rate limit), especially from Render IP ranges.
+    SDK Exchange() constructor can 429 because it fetches /info internally.
+    So we retry Exchange init with backoff.
     """
     global _exchange
-
-    if _exchange is not None:
-        return _exchange
 
     if not HL_ACCOUNT_ADDRESS or not HL_SECRET_KEY:
         raise HTTPException(
@@ -139,42 +145,39 @@ def get_exchange_with_retry(max_attempts: int = 6) -> Exchange:
             detail="Missing HL_ACCOUNT_ADDRESS or HL_SECRET_KEY in env vars",
         )
 
-    wallet = Account.from_key(HL_SECRET_KEY)
+    if _exchange is not None:
+        return _exchange
 
     backoff = 1
     last_err = None
 
     for attempt in range(1, max_attempts + 1):
         try:
+            wallet = Account.from_key(HL_SECRET_KEY)
+
             # Support multiple SDK signatures
             try:
-                ex = Exchange(wallet=wallet, base_url=HL_BASE_URL, account_address=HL_ACCOUNT_ADDRESS)
+                _exchange = Exchange(wallet=wallet, base_url=HL_BASE_URL, account_address=HL_ACCOUNT_ADDRESS)
             except TypeError:
                 try:
-                    ex = Exchange(wallet, HL_BASE_URL, HL_ACCOUNT_ADDRESS)
+                    _exchange = Exchange(wallet, HL_BASE_URL, HL_ACCOUNT_ADDRESS)
                 except TypeError:
-                    ex = Exchange(HL_ACCOUNT_ADDRESS, HL_SECRET_KEY, base_url=HL_BASE_URL)
+                    _exchange = Exchange(HL_ACCOUNT_ADDRESS, HL_SECRET_KEY, base_url=HL_BASE_URL)
 
-            _exchange = ex
-            print("✅ Exchange initialized successfully")
             return _exchange
 
         except Exception as e:
             last_err = e
-            msg = str(e)
-
-            # detect rate limiting
-            if "429" in msg:
+            if is_429(e):
                 print(f"⚠️ Exchange init hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
                 sleep(backoff)
-                backoff = min(backoff * 2, 12)
+                backoff = min(backoff * 2, 10)
                 continue
+            print(f"⚠️ Exchange init failed (attempt {attempt}/{max_attempts}): {e}. Backing off {backoff}s...")
+            sleep(backoff)
+            backoff = min(backoff * 2, 10)
 
-            # not a 429 -> fail fast
-            log_exception("❌ Exchange init failed (non-429) ❌", e)
-            raise HTTPException(status_code=500, detail=f"Exchange init failed: {e}")
-
-    raise HTTPException(status_code=503, detail=f"Exchange init failed after retries (last_err={last_err})")
+    raise HTTPException(status_code=503, detail=f"Failed to init Exchange after retries: {last_err}")
 
 
 def fetch_all_mids_with_retry(max_attempts: int = 5):
@@ -203,6 +206,72 @@ def fetch_all_mids_with_retry(max_attempts: int = 5):
     raise HTTPException(status_code=503, detail=f"Failed to fetch allMids after retries: {last_err}")
 
 
+def hl_order_with_retry(exchange: Exchange, *, coin: str, is_buy: bool, sz: Decimal, px: Decimal, tif: str,
+                        reduce_only: bool, max_attempts: int = 5) -> dict:
+    backoff = 1
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return exchange.order(
+                coin,
+                is_buy,
+                float(sz),
+                float(px),
+                {"limit": {"tif": tif}},
+                reduce_only=reduce_only,
+            )
+        except Exception as e:
+            last_err = e
+            if is_429(e):
+                print(f"⚠️ order hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
+                sleep(backoff)
+                backoff = min(backoff * 2, 10)
+                continue
+            raise
+    raise HTTPException(status_code=503, detail=f"Order failed after retries (last_err={last_err})")
+
+
+def hl_trigger_with_retry(exchange: Exchange, *, coin: str, is_buy: bool, sz: Decimal, trigger_px: Decimal,
+                          tpsl: str, reduce_only: bool, max_attempts: int = 5) -> dict:
+    """
+    Trigger order: isMarket True, triggerPx must be float.
+    """
+    backoff = 1
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return exchange.order(
+                coin,
+                is_buy,
+                float(sz),
+                0.0,
+                {"trigger": {"isMarket": True, "triggerPx": float(trigger_px), "tpsl": tpsl}},
+                reduce_only=reduce_only,
+            )
+        except Exception as e:
+            last_err = e
+            if is_429(e):
+                print(f"⚠️ trigger {tpsl} hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
+                sleep(backoff)
+                backoff = min(backoff * 2, 10)
+                continue
+            raise
+    raise HTTPException(status_code=503, detail=f"Trigger {tpsl} failed after retries (last_err={last_err})")
+
+
+def parse_entry_state(main_result: dict) -> Tuple[bool, bool]:
+    """
+    Returns (is_resting, is_filled) from HL statuses.
+    """
+    try:
+        statuses = main_result.get("response", {}).get("data", {}).get("statuses", [])
+        is_resting = any(isinstance(s, dict) and "resting" in s for s in statuses)
+        is_filled = any(isinstance(s, dict) and "filled" in s for s in statuses)
+        return is_resting, is_filled
+    except Exception:
+        return False, False
+
+
 @app.post("/tv")
 async def tv_webhook(req: Request):
     print("\n✅✅✅ /tv HIT (request received) ✅✅✅")
@@ -229,10 +298,19 @@ async def tv_webhook(req: Request):
     if data.get("type") != "order":
         return {"ok": True, "mode": "ignored"}
 
+    extra = data.get("extra") or {}
+
+    # DEDUP KEY:
+    # If tv_order_id is generic ("Long"/"Short") or missing, use a hash of the payload
     tv_order_id = str(data.get("tv_order_id", "")).strip()
-    if seen_recently(tv_order_id):
-        print(f"⏭️ DUPLICATE webhook ignored: {tv_order_id}")
-        return {"ok": True, "mode": "deduped", "tv_order_id": tv_order_id}
+    if tv_order_id and tv_order_id not in ("Long", "Short") and len(tv_order_id) > 6:
+        dedup_key = tv_order_id
+    else:
+        dedup_key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    if seen_recently(dedup_key):
+        print(f"⏭️ DUPLICATE webhook ignored: {dedup_key}")
+        return {"ok": True, "mode": "deduped", "dedup_key": dedup_key, "tv_order_id": tv_order_id}
 
     if tv_order_id in TV_SKIP_ORDER_IDS:
         print(f"⏭️ SKIPPED: {tv_order_id}")
@@ -253,22 +331,39 @@ async def tv_webhook(req: Request):
     if sz is None or sz <= 0:
         raise HTTPException(status_code=400, detail="Invalid qty")
 
-    order_type = str(data.get("order_type", "market")).lower()
-    reduce_only_bool = parse_bool(data.get("reduce_only", False))
+    # Prefer `extra` (TradingView sends it there)
+    order_type = str(extra.get("order_type") or data.get("order_type") or "market").lower()
+    reduce_only_bool = parse_bool(extra.get("reduce_only", data.get("reduce_only", False)))
+
+    # TP/SL + entry limit price (all come from extra in your alert)
+    tp_trigger = to_decimal(extra.get("tp_trigger") or data.get("tp_trigger"))
+    sl_trigger = to_decimal(extra.get("sl") or data.get("sl"))
+    limit_price = to_decimal(extra.get("price") or data.get("price"))
 
     print("\n=== Parsed ===")
-    print(f"coin={coin} is_buy={is_buy} sz={sz} order_type={order_type} reduce_only={reduce_only_bool}")
+    print(
+        f"coin={coin} is_buy={is_buy} sz={sz} order_type={order_type} reduce_only={reduce_only_bool} "
+        f"limit_price={limit_price} tp_trigger={tp_trigger} sl_trigger={sl_trigger}"
+    )
 
     if not HL_LIVE_TRADING:
         print("⚠️ SAFE MODE — not sent")
-        return {"ok": True, "mode": "safe", "coin": coin, "is_buy": is_buy, "sz": str(sz), "order_type": order_type}
+        return {
+            "ok": True,
+            "mode": "safe",
+            "coin": coin,
+            "is_buy": is_buy,
+            "sz": str(sz),
+            "order_type": order_type,
+            "reduce_only": reduce_only_bool,
+            "limit_price": str(limit_price) if limit_price else None,
+            "tp_trigger": str(tp_trigger) if tp_trigger else None,
+            "sl_trigger": str(sl_trigger) if sl_trigger else None,
+        }
 
     steps = ASSET_STEPS.get(coin)
     if not steps:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No hardcoded steps for coin={coin}. Add it to ASSET_STEPS.",
-        )
+        raise HTTPException(status_code=400, detail=f"No hardcoded steps for coin={coin}. Add it to ASSET_STEPS.")
 
     sz_step = steps["sz_step"]
     px_step = steps["px_step"]
@@ -281,41 +376,120 @@ async def tv_webhook(req: Request):
         print(f"ℹ️ Size rounded: raw_sz={sz} sz_step={sz_step} sz_rounded={sz_rounded}")
     sz = sz_rounded
 
-    if order_type != "market":
-        raise HTTPException(status_code=400, detail="This lightweight version supports only market orders for now.")
+    exchange = get_exchange()
 
-    # Build Exchange with retry/backoff (prevents random 500 on 429 during init)
-    exchange = get_exchange_with_retry()
-
-    # Get mid price (one /info call) then create IOC limit px with slippage
-    mids = fetch_all_mids_with_retry()
-    if coin not in mids:
-        raise HTTPException(status_code=400, detail=f"Coin not found in allMids: {coin}")
-
-    mid = Decimal(str(mids[coin]))
-
-    px_raw = mid * (Decimal("1") + HL_SLIPPAGE) if is_buy else mid * (Decimal("1") - HL_SLIPPAGE)
-    px = round_to_step(px_raw, px_step)
-
-    print(f"\n=== PRICE DEBUG === coin={coin} mid={mid} px_raw={px_raw} px_step={px_step} px_rounded={px}")
-
+    # ----------------------------
+    # ENTRY ORDER (market IOC or limit GTC)
+    # ----------------------------
     try:
-        main_result = exchange.order(
-            coin,
-            is_buy,
-            float(sz),
-            float(px),
-            {"limit": {"tif": "Ioc"}},  # order_type positional arg
-            reduce_only=reduce_only_bool,
-        )
+        if order_type == "limit":
+            if limit_price is None:
+                raise HTTPException(status_code=400, detail="limit order requires extra.price")
+
+            lp = round_to_step(Decimal(str(limit_price)), px_step)
+            print(f"=== LIMIT DEBUG === coin={coin} limit_raw={limit_price} px_step={px_step} limit_rounded={lp}")
+
+            main_result = hl_order_with_retry(
+                exchange,
+                coin=coin,
+                is_buy=is_buy,
+                sz=sz,
+                px=lp,
+                tif="Gtc",
+                reduce_only=reduce_only_bool,
+            )
+
+        elif order_type == "market":
+            mids = fetch_all_mids_with_retry()
+            if coin not in mids:
+                raise HTTPException(status_code=400, detail=f"Coin not found in allMids: {coin}")
+
+            mid = Decimal(str(mids[coin]))
+            px_raw = mid * (Decimal("1") + HL_SLIPPAGE) if is_buy else mid * (Decimal("1") - HL_SLIPPAGE)
+            px = round_to_step(px_raw, px_step)
+
+            print(f"\n=== PRICE DEBUG === coin={coin} mid={mid} px_raw={px_raw} px_step={px_step} px_rounded={px}")
+
+            main_result = hl_order_with_retry(
+                exchange,
+                coin=coin,
+                is_buy=is_buy,
+                sz=sz,
+                px=px,
+                tif="Ioc",
+                reduce_only=reduce_only_bool,
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported order_type={order_type}")
+
+    except HTTPException:
+        raise
     except Exception as e:
-        msg = str(e)
-        log_exception("❌❌❌ HYPERLIQUID LIVE ORDER FAILED ❌❌❌", e)
-        if "429" in msg:
-            raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429). TradingView will retry.")
-        raise HTTPException(status_code=500, detail=f"Hyperliquid order failed: {e}")
+        log_exception("❌❌❌ HYPERLIQUID ENTRY ORDER FAILED ❌❌❌", e)
+        if is_429(e):
+            raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429) on entry order.")
+        raise HTTPException(status_code=500, detail=f"Hyperliquid entry order failed: {e}")
 
     print("\n=== HL MAIN ORDER RESPONSE ===")
     print(main_result)
 
-    return {"ok": True, "mode": "live", "main": main_result, "tv_order_id": tv_order_id}
+    # Decide reduce_only for TP/SL:
+    # - if entry is resting (not filled yet): reduce_only=False (otherwise may be rejected)
+    # - if entry is filled: reduce_only=True (safest)
+    entry_is_resting, entry_is_filled = parse_entry_state(main_result)
+    tpsl_reduce_only = False if entry_is_resting else True
+    print(f"ℹ️ Entry status: resting={entry_is_resting} filled={entry_is_filled} -> tpsl_reduce_only={tpsl_reduce_only}")
+
+    # ----------------------------
+    # TP/SL TRIGGERS (optional)
+    # ----------------------------
+    tpsl_results = []
+    try:
+        # For a long: TP/SL are sells. For a short: TP/SL are buys.
+        tpsl_is_buy = not is_buy
+
+        if tp_trigger is not None:
+            tp_px = round_to_step(Decimal(str(tp_trigger)), px_step)
+            tp_res = hl_trigger_with_retry(
+                exchange,
+                coin=coin,
+                is_buy=tpsl_is_buy,
+                sz=sz,
+                trigger_px=tp_px,
+                tpsl="tp",
+                reduce_only=tpsl_reduce_only,
+            )
+            print("\n=== HL TP RESPONSE ===")
+            print(tp_res)
+            tpsl_results.append({"tp": tp_res, "reduce_only": tpsl_reduce_only, "triggerPx": str(tp_px)})
+
+        if sl_trigger is not None:
+            sl_px = round_to_step(Decimal(str(sl_trigger)), px_step)
+            sl_res = hl_trigger_with_retry(
+                exchange,
+                coin=coin,
+                is_buy=tpsl_is_buy,
+                sz=sz,
+                trigger_px=sl_px,
+                tpsl="sl",
+                reduce_only=tpsl_reduce_only,
+            )
+            print("\n=== HL SL RESPONSE ===")
+            print(sl_res)
+            tpsl_results.append({"sl": sl_res, "reduce_only": tpsl_reduce_only, "triggerPx": str(sl_px)})
+
+    except Exception as e:
+        log_exception("⚠️ TP/SL PLACEMENT WARNING ⚠️", e)
+        if is_429(e):
+            tpsl_results.append({"warning": "TP/SL not placed due to 429 rate limit. Retry later."})
+        else:
+            tpsl_results.append({"warning": f"TP/SL not placed: {e}"})
+
+    return {
+        "ok": True,
+        "mode": "live",
+        "main": main_result,
+        "tpsl": tpsl_results,
+        "tv_order_id": tv_order_id,
+        "dedup_key": dedup_key,
+    }
