@@ -2,9 +2,9 @@ import os
 import json
 import traceback
 import hashlib
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, ROUND_FLOOR
 from time import time, sleep
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
@@ -120,11 +120,35 @@ def seen_recently(k: str) -> bool:
     return False
 
 
-def round_to_step(x: Decimal, step: Decimal) -> Decimal:
+def round_to_step_floor(x: Decimal, step: Decimal) -> Decimal:
+    """Floor rounding to the nearest step (safe for sizes)."""
     if step <= 0:
         return x
-    n = (x / step).to_integral_value(rounding="ROUND_FLOOR")
+    n = (x / step).to_integral_value(rounding=ROUND_FLOOR)
     return n * step
+
+
+def round_to_step_nearest(x: Decimal, step: Decimal) -> Decimal:
+    """Nearest rounding to the nearest step (recommended for prices/triggers)."""
+    if step <= 0:
+        return x
+    n = (x / step).to_integral_value(rounding=ROUND_HALF_UP)
+    return n * step
+
+
+def fmt_px_for_hl(px: Decimal, px_step: Decimal) -> Tuple[Decimal, Union[int, float]]:
+    """
+    Returns:
+      - rounded Decimal px_rounded
+      - JSON-safe numeric value to pass into SDK:
+          * int when px_step == 1 (prevents 69400.0 style issues)
+          * float otherwise
+    """
+    px_rounded = round_to_step_nearest(px, px_step)
+    if px_step == Decimal("1"):
+        # enforce integer prices for tick=1 markets
+        return px_rounded, int(px_rounded)
+    return px_rounded, float(px_rounded)
 
 
 def is_429(e: Exception) -> bool:
@@ -206,8 +230,17 @@ def fetch_all_mids_with_retry(max_attempts: int = 5):
     raise HTTPException(status_code=503, detail=f"Failed to fetch allMids after retries: {last_err}")
 
 
-def hl_order_with_retry(exchange: Exchange, *, coin: str, is_buy: bool, sz: Decimal, px: Decimal, tif: str,
-                        reduce_only: bool, max_attempts: int = 5) -> dict:
+def hl_order_with_retry(
+    exchange: Exchange,
+    *,
+    coin: str,
+    is_buy: bool,
+    sz: Decimal,
+    px_num: Union[int, float],
+    tif: str,
+    reduce_only: bool,
+    max_attempts: int = 5,
+) -> dict:
     backoff = 1
     last_err = None
     for attempt in range(1, max_attempts + 1):
@@ -216,7 +249,7 @@ def hl_order_with_retry(exchange: Exchange, *, coin: str, is_buy: bool, sz: Deci
                 coin,
                 is_buy,
                 float(sz),
-                float(px),
+                px_num,
                 {"limit": {"tif": tif}},
                 reduce_only=reduce_only,
             )
@@ -231,10 +264,22 @@ def hl_order_with_retry(exchange: Exchange, *, coin: str, is_buy: bool, sz: Deci
     raise HTTPException(status_code=503, detail=f"Order failed after retries (last_err={last_err})")
 
 
-def hl_trigger_with_retry(exchange: Exchange, *, coin: str, is_buy: bool, sz: Decimal, trigger_px: Decimal,
-                          tpsl: str, reduce_only: bool, max_attempts: int = 5) -> dict:
+def hl_trigger_with_retry(
+    exchange: Exchange,
+    *,
+    coin: str,
+    is_buy: bool,
+    sz: Decimal,
+    trigger_px_num: Union[int, float],
+    tpsl: str,
+    reduce_only: bool,
+    max_attempts: int = 5,
+) -> dict:
     """
-    Trigger order: isMarket True, triggerPx must be float.
+    Trigger order:
+      - isMarket True
+      - triggerPx must obey tick/precision rules (for BTC tick=1 -> use int)
+      - When isMarket=True, limit_px should be 0 (NOT 0.0 to avoid format weirdness)
     """
     backoff = 1
     last_err = None
@@ -244,8 +289,8 @@ def hl_trigger_with_retry(exchange: Exchange, *, coin: str, is_buy: bool, sz: De
                 coin,
                 is_buy,
                 float(sz),
-                0.0,
-                {"trigger": {"isMarket": True, "triggerPx": float(trigger_px), "tpsl": tpsl}},
+                0,  # IMPORTANT: use int 0 for market trigger
+                {"trigger": {"isMarket": True, "triggerPx": trigger_px_num, "tpsl": tpsl}},
                 reduce_only=reduce_only,
             )
         except Exception as e:
@@ -368,8 +413,8 @@ async def tv_webhook(req: Request):
     sz_step = steps["sz_step"]
     px_step = steps["px_step"]
 
-    # round size to lot step
-    sz_rounded = round_to_step(sz, sz_step)
+    # round size to lot step (floor)
+    sz_rounded = round_to_step_floor(sz, sz_step)
     if sz_rounded <= 0:
         raise HTTPException(status_code=400, detail=f"Qty too small after rounding to sz_step={sz_step}")
     if sz_rounded != sz:
@@ -386,15 +431,19 @@ async def tv_webhook(req: Request):
             if limit_price is None:
                 raise HTTPException(status_code=400, detail="limit order requires extra.price")
 
-            lp = round_to_step(Decimal(str(limit_price)), px_step)
-            print(f"=== LIMIT DEBUG === coin={coin} limit_raw={limit_price} px_step={px_step} limit_rounded={lp}")
+            lp_dec = Decimal(str(limit_price))
+            lp_rounded, lp_num = fmt_px_for_hl(lp_dec, px_step)
+            print(
+                f"=== LIMIT DEBUG === coin={coin} limit_raw={limit_price} px_step={px_step} "
+                f"limit_rounded={lp_rounded} limit_num={lp_num}"
+            )
 
             main_result = hl_order_with_retry(
                 exchange,
                 coin=coin,
                 is_buy=is_buy,
                 sz=sz,
-                px=lp,
+                px_num=lp_num,
                 tif="Gtc",
                 reduce_only=reduce_only_bool,
             )
@@ -406,16 +455,19 @@ async def tv_webhook(req: Request):
 
             mid = Decimal(str(mids[coin]))
             px_raw = mid * (Decimal("1") + HL_SLIPPAGE) if is_buy else mid * (Decimal("1") - HL_SLIPPAGE)
-            px = round_to_step(px_raw, px_step)
+            px_rounded, px_num = fmt_px_for_hl(px_raw, px_step)
 
-            print(f"\n=== PRICE DEBUG === coin={coin} mid={mid} px_raw={px_raw} px_step={px_step} px_rounded={px}")
+            print(
+                f"\n=== PRICE DEBUG === coin={coin} mid={mid} px_raw={px_raw} px_step={px_step} "
+                f"px_rounded={px_rounded} px_num={px_num}"
+            )
 
             main_result = hl_order_with_retry(
                 exchange,
                 coin=coin,
                 is_buy=is_buy,
                 sz=sz,
-                px=px,
+                px_num=px_num,
                 tif="Ioc",
                 reduce_only=reduce_only_bool,
             )
@@ -449,34 +501,44 @@ async def tv_webhook(req: Request):
         tpsl_is_buy = not is_buy
 
         if tp_trigger is not None:
-            tp_px = round_to_step(Decimal(str(tp_trigger)), px_step)
+            tp_dec = Decimal(str(tp_trigger))
+            tp_rounded, tp_num = fmt_px_for_hl(tp_dec, px_step)
+            print(
+                f"=== TP DEBUG === coin={coin} tp_raw={tp_trigger} px_step={px_step} "
+                f"tp_rounded={tp_rounded} tp_num={tp_num}"
+            )
             tp_res = hl_trigger_with_retry(
                 exchange,
                 coin=coin,
                 is_buy=tpsl_is_buy,
                 sz=sz,
-                trigger_px=tp_px,
+                trigger_px_num=tp_num,
                 tpsl="tp",
                 reduce_only=tpsl_reduce_only,
             )
             print("\n=== HL TP RESPONSE ===")
             print(tp_res)
-            tpsl_results.append({"tp": tp_res, "reduce_only": tpsl_reduce_only, "triggerPx": str(tp_px)})
+            tpsl_results.append({"tp": tp_res, "reduce_only": tpsl_reduce_only, "triggerPx": str(tp_rounded)})
 
         if sl_trigger is not None:
-            sl_px = round_to_step(Decimal(str(sl_trigger)), px_step)
+            sl_dec = Decimal(str(sl_trigger))
+            sl_rounded, sl_num = fmt_px_for_hl(sl_dec, px_step)
+            print(
+                f"=== SL DEBUG === coin={coin} sl_raw={sl_trigger} px_step={px_step} "
+                f"sl_rounded={sl_rounded} sl_num={sl_num}"
+            )
             sl_res = hl_trigger_with_retry(
                 exchange,
                 coin=coin,
                 is_buy=tpsl_is_buy,
                 sz=sz,
-                trigger_px=sl_px,
+                trigger_px_num=sl_num,
                 tpsl="sl",
                 reduce_only=tpsl_reduce_only,
             )
             print("\n=== HL SL RESPONSE ===")
             print(sl_res)
-            tpsl_results.append({"sl": sl_res, "reduce_only": tpsl_reduce_only, "triggerPx": str(sl_px)})
+            tpsl_results.append({"sl": sl_res, "reduce_only": tpsl_reduce_only, "triggerPx": str(sl_rounded)})
 
     except Exception as e:
         log_exception("⚠️ TP/SL PLACEMENT WARNING ⚠️", e)
