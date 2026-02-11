@@ -246,8 +246,7 @@ def hl_grouped_orders_with_retry(
             return exchange.bulk_orders(order_requests, grouping=grouping)
         except TypeError as e:
             last_err = e
-            print("⚠️ Your installed hyperliquid SDK bulk_orders() does not accept grouping=. "
-                  "Upgrade the SDK.")
+            print("⚠️ Your installed hyperliquid SDK bulk_orders() does not accept grouping=. Upgrade the SDK.")
             raise
         except Exception as e:
             last_err = e
@@ -411,9 +410,10 @@ async def tv_webhook(req: Request):
     exchange = get_exchange()
 
     # =====================================================================
-    # TPSL-ONLY PATH (NEW): type="tpsl"
+    # TPSL-ONLY PATH (FIXED): type="tpsl"
     #  - NO ENTRY order
     #  - Send TP/SL as position TP/SL: grouping="positionTpsl"
+    #  - IMPORTANT FIX: send limit_px and triggerPx as STRINGS ("0", "67716", etc.)
     # =====================================================================
     if msg_type == "tpsl":
         if tp_trigger is None and sl_trigger is None:
@@ -427,33 +427,35 @@ async def tv_webhook(req: Request):
             if tp_trigger is not None:
                 tp_dec = Decimal(str(tp_trigger))
                 tp_rounded, tp_num = fmt_px_for_hl(tp_dec, px_step)
+                tp_px_str = str(int(tp_rounded)) if px_step == Decimal("1") else str(tp_rounded)
                 print(
                     f"=== TP DEBUG (tpsl-only) === coin={coin} tp_raw={tp_trigger} px_step={px_step} "
-                    f"tp_rounded={tp_rounded} tp_num={tp_num}"
+                    f"tp_rounded={tp_rounded} tp_num={tp_num} tp_str={tp_px_str}"
                 )
                 orders.append({
                     "coin": coin,
                     "is_buy": tpsl_is_buy,
                     "sz": float(sz),
-                    "limit_px": 0,
-                    "order_type": {"trigger": {"isMarket": True, "triggerPx": tp_num, "tpsl": "tp"}},
-                    "reduce_only": True,  # SAFETY: never increase position
+                    "limit_px": "0",  # STRING (important)
+                    "order_type": {"trigger": {"isMarket": True, "triggerPx": tp_px_str, "tpsl": "tp"}},
+                    "reduce_only": True,  # safety
                 })
 
             if sl_trigger is not None:
                 sl_dec = Decimal(str(sl_trigger))
                 sl_rounded, sl_num = fmt_px_for_hl(sl_dec, px_step)
+                sl_px_str = str(int(sl_rounded)) if px_step == Decimal("1") else str(sl_rounded)
                 print(
                     f"=== SL DEBUG (tpsl-only) === coin={coin} sl_raw={sl_trigger} px_step={px_step} "
-                    f"sl_rounded={sl_rounded} sl_num={sl_num}"
+                    f"sl_rounded={sl_rounded} sl_num={sl_num} sl_str={sl_px_str}"
                 )
                 orders.append({
                     "coin": coin,
                     "is_buy": tpsl_is_buy,
                     "sz": float(sz),
-                    "limit_px": 0,
-                    "order_type": {"trigger": {"isMarket": True, "triggerPx": sl_num, "tpsl": "sl"}},
-                    "reduce_only": True,  # SAFETY
+                    "limit_px": "0",  # STRING (important)
+                    "order_type": {"trigger": {"isMarket": True, "triggerPx": sl_px_str, "tpsl": "sl"}},
+                    "reduce_only": True,  # safety
                 })
 
             print("\n=== POSITION TPSL DEBUG ===")
@@ -493,9 +495,8 @@ async def tv_webhook(req: Request):
 
     # ---------------------------------------------------------------------
     # ORDER PATH: type="order"
-    #  - Keep your existing logic:
-    #    * If TP/SL provided -> try grouped normalTpsl bracket
-    #    * Else -> entry only
+    #  - If TP/SL provided -> try grouped normalTpsl bracket
+    #  - Else -> entry only
     # ---------------------------------------------------------------------
     has_tpsl = (tp_trigger is not None) or (sl_trigger is not None)
 
@@ -554,32 +555,34 @@ async def tv_webhook(req: Request):
             if tp_trigger is not None:
                 tp_dec = Decimal(str(tp_trigger))
                 tp_rounded, tp_num = fmt_px_for_hl(tp_dec, px_step)
+                tp_px_str = str(int(tp_rounded)) if px_step == Decimal("1") else str(tp_rounded)
                 print(
                     f"=== TP DEBUG === coin={coin} tp_raw={tp_trigger} px_step={px_step} "
-                    f"tp_rounded={tp_rounded} tp_num={tp_num}"
+                    f"tp_rounded={tp_rounded} tp_num={tp_num} tp_str={tp_px_str}"
                 )
                 orders.append({
                     "coin": coin,
                     "is_buy": tpsl_is_buy,
                     "sz": float(sz),
-                    "limit_px": 0,  # market on trigger
-                    "order_type": {"trigger": {"isMarket": True, "triggerPx": tp_num, "tpsl": "tp"}},
+                    "limit_px": "0",  # STRING is safer for triggers
+                    "order_type": {"trigger": {"isMarket": True, "triggerPx": tp_px_str, "tpsl": "tp"}},
                     "reduce_only": False,  # grouped "normalTpsl"
                 })
 
             if sl_trigger is not None:
                 sl_dec = Decimal(str(sl_trigger))
                 sl_rounded, sl_num = fmt_px_for_hl(sl_dec, px_step)
+                sl_px_str = str(int(sl_rounded)) if px_step == Decimal("1") else str(sl_rounded)
                 print(
                     f"=== SL DEBUG === coin={coin} sl_raw={sl_trigger} px_step={px_step} "
-                    f"sl_rounded={sl_rounded} sl_num={sl_num}"
+                    f"sl_rounded={sl_rounded} sl_num={sl_num} sl_str={sl_px_str}"
                 )
                 orders.append({
                     "coin": coin,
                     "is_buy": tpsl_is_buy,
                     "sz": float(sz),
-                    "limit_px": 0,  # market on trigger
-                    "order_type": {"trigger": {"isMarket": True, "triggerPx": sl_num, "tpsl": "sl"}},
+                    "limit_px": "0",  # STRING is safer for triggers
+                    "order_type": {"trigger": {"isMarket": True, "triggerPx": sl_px_str, "tpsl": "sl"}},
                     "reduce_only": False,  # grouped "normalTpsl"
                 })
 
