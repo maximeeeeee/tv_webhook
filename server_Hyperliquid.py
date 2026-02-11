@@ -422,19 +422,20 @@ async def tv_webhook(req: Request):
                     if wrong_side:
                         print(f"⚠️ SL skipped: trigger on wrong side. mid={mid} sl={sl_rounded} close_is_buy={close_is_buy}")
                     else:
+                        mid_rounded, mid_num = fmt_px_for_hl(mid, px_step)
                         print(
                             f"=== SL STOP-MARKET (reduce-only) === raw={sl_trigger} rounded={sl_rounded} "
-                            f"mid={mid} triggerPx={float(sl_num)}"
+                            f"mid={mid_rounded} triggerPx={float(sl_num)}"
                         )
 
-                        # IMPORTANT for your SDK: triggerPx must be present in the trigger dict.
-                        # Use px_num=1 (dummy) instead of 0 to avoid 'invalid price' edge cases.
+                        # IMPORTANT: For HL, px_num must be within ~95% of reference price.
+                        # Using px_num=1 triggers "95% away" rejection. Use a price near mid.
                         res_sl = hl_order_with_retry(
                             exchange,
                             coin=coin,
                             is_buy=close_is_buy,
                             sz=sz,
-                            px_num=1,
+                            px_num=mid_num,
                             tif="Gtc",
                             reduce_only=True,
                             order_type_wire={
@@ -445,7 +446,7 @@ async def tv_webhook(req: Request):
                                 }
                             },
                         )
-                        results.append({"sl_stop_market": res_sl, "triggerPx": str(sl_rounded)})
+                        results.append({"sl_stop_market": res_sl, "triggerPx": str(sl_rounded), "refPx": str(mid_rounded)})
 
             print("\n=== HL TPSL RESPONSE (TP limit + SL stop-market) ===")
             print(results)
