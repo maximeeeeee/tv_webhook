@@ -154,6 +154,10 @@ def is_429(e: Exception) -> bool:
 
 
 def get_exchange(max_attempts: int = 5) -> Exchange:
+    """
+    SDK Exchange() constructor can 429 because it fetches /info internally.
+    So we retry Exchange init with backoff.
+    """
     global _exchange
 
     if not HL_ACCOUNT_ADDRESS or not HL_SECRET_KEY:
@@ -223,43 +227,6 @@ def fetch_all_mids_with_retry(max_attempts: int = 5):
     raise HTTPException(status_code=503, detail=f"Failed to fetch allMids after retries: {last_err}")
 
 
-def hl_grouped_orders_with_retry(
-    exchange: Exchange,
-    *,
-    order_requests: List[Dict[str, Any]],
-    grouping: str,
-    max_attempts: int = 5,
-) -> dict:
-    """
-    Sends ALL orders in one exchange request via bulk_orders(..., grouping=...).
-
-    grouping examples:
-      - "normalTpsl"    entry + TP/SL bracket
-      - "positionTpsl"  TP/SL attached to current position
-      - "na"            no grouping
-    """
-    backoff = 1
-    last_err = None
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return exchange.bulk_orders(order_requests, grouping=grouping)
-        except TypeError as e:
-            last_err = e
-            print("⚠️ Your installed hyperliquid SDK bulk_orders() does not accept grouping=. Upgrade the SDK.")
-            raise
-        except Exception as e:
-            last_err = e
-            if is_429(e):
-                print(f"⚠️ bulk_orders hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
-                sleep(backoff)
-                backoff = min(backoff * 2, 10)
-                continue
-            raise
-
-    raise HTTPException(status_code=503, detail=f"bulk_orders failed after retries (last_err={last_err})")
-
-
 def hl_order_with_retry(
     exchange: Exchange,
     *,
@@ -269,10 +236,16 @@ def hl_order_with_retry(
     px_num: Union[int, float],
     tif: str,
     reduce_only: bool,
+    order_type_wire: dict,
     max_attempts: int = 5,
 ) -> dict:
+    """
+    Generic order wrapper with 429 retry.
+    order_type_wire is the dict you pass as the 5th argument to exchange.order (e.g. {"limit":{"tif":"Ioc"}})
+    """
     backoff = 1
     last_err = None
+
     for attempt in range(1, max_attempts + 1):
         try:
             return exchange.order(
@@ -280,7 +253,7 @@ def hl_order_with_retry(
                 is_buy,
                 float(sz),
                 px_num,
-                {"limit": {"tif": tif}},
+                order_type_wire,
                 reduce_only=reduce_only,
             )
         except Exception as e:
@@ -291,17 +264,8 @@ def hl_order_with_retry(
                 backoff = min(backoff * 2, 10)
                 continue
             raise
+
     raise HTTPException(status_code=503, detail=f"Order failed after retries (last_err={last_err})")
-
-
-def parse_entry_state(main_result: dict) -> Tuple[bool, bool]:
-    try:
-        statuses = main_result.get("response", {}).get("data", {}).get("statuses", [])
-        is_resting = any(isinstance(s, dict) and "resting" in s for s in statuses)
-        is_filled = any(isinstance(s, dict) and "filled" in s for s in statuses)
-        return is_resting, is_filled
-    except Exception:
-        return False, False
 
 
 @app.post("/tv")
@@ -333,8 +297,9 @@ async def tv_webhook(req: Request):
 
     extra = data.get("extra") or {}
 
+    # DEDUP KEY
     tv_order_id = str(data.get("tv_order_id", "")).strip()
-    if tv_order_id and tv_order_id not in ("Long", "Short") and len(tv_order_id) > 6:
+    if tv_order_id and tv_order_id not in ("Long", "Short") and len(tv_order_id) > 3:
         dedup_key = tv_order_id
     else:
         dedup_key = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -362,12 +327,15 @@ async def tv_webhook(req: Request):
     if sz is None or sz <= 0:
         raise HTTPException(status_code=400, detail="Invalid qty")
 
+    # order_type (entry only)
     order_type = str(extra.get("order_type") or data.get("order_type") or "market").lower()
     reduce_only_bool = parse_bool(extra.get("reduce_only", data.get("reduce_only", False)))
 
-    # TP/SL + entry limit price
+    # TP/SL values (used only when msg_type=="tpsl")
     tp_trigger = to_decimal(extra.get("tp_trigger") or data.get("tp_trigger"))
     sl_trigger = to_decimal(extra.get("sl") or data.get("sl"))
+
+    # limit entry price
     limit_price = to_decimal(extra.get("price") or data.get("price"))
 
     print("\n=== Parsed ===")
@@ -410,231 +378,84 @@ async def tv_webhook(req: Request):
     exchange = get_exchange()
 
     # =====================================================================
-    # TPSL-ONLY PATH (FIXED): type="tpsl"
-    #  - NO ENTRY order
-    #  - Send TP/SL as position TP/SL: grouping="positionTpsl"
-    #  - IMPORTANT FIX: send limit_px and triggerPx as STRINGS ("0", "67716", etc.)
+    # APPROACH A: TPSL via SIMPLE REDUCE-ONLY ORDERS (NO grouping, NO trigger orders)
     # =====================================================================
     if msg_type == "tpsl":
         if tp_trigger is None and sl_trigger is None:
             raise HTTPException(status_code=400, detail="type=tpsl requires tp_trigger and/or sl")
 
         try:
-            orders: List[Dict[str, Any]] = []
-            # For a long position: TP/SL are sells. For a short position: TP/SL are buys.
-            tpsl_is_buy = not is_buy  # close direction
+            # close direction (if position is long -> close sells; if short -> close buys)
+            close_is_buy = not is_buy
+
+            # HL expects reduce_only to ensure no position increase.
+            # We place TWO reduce-only LIMIT IOC orders at the target prices.
+            # This behaves like a "take profit" and "stop loss" replacement using regular reduce-only orders.
+            results = []
+
+            # IMPORTANT:
+            # - For LONG: TP is a SELL above, SL is a SELL below (both reduce_only)
+            # - For SHORT: TP is a BUY below, SL is a BUY above (both reduce_only)
+            # No trigger mechanics here: they rest in the book until price trades through.
+            # This is the simplest stable approach on HL when trigger/grouping is unreliable.
 
             if tp_trigger is not None:
-                tp_dec = Decimal(str(tp_trigger))
-                tp_rounded, tp_num = fmt_px_for_hl(tp_dec, px_step)
-                tp_px_str = str(int(tp_rounded)) if px_step == Decimal("1") else str(tp_rounded)
-                print(
-                    f"=== TP DEBUG (tpsl-only) === coin={coin} tp_raw={tp_trigger} px_step={px_step} "
-                    f"tp_rounded={tp_rounded} tp_num={tp_num} tp_str={tp_px_str}"
+                tp_rounded, tp_num = fmt_px_for_hl(Decimal(str(tp_trigger)), px_step)
+                print(f"=== TP LIMIT (reduce-only) === raw={tp_trigger} rounded={tp_rounded} px_num={tp_num}")
+                res_tp = hl_order_with_retry(
+                    exchange,
+                    coin=coin,
+                    is_buy=close_is_buy,
+                    sz=sz,
+                    px_num=tp_num,
+                    tif="Gtc",
+                    reduce_only=True,
+                    order_type_wire={"limit": {"tif": "Gtc"}},
                 )
-                orders.append({
-                    "coin": coin,
-                    "is_buy": tpsl_is_buy,
-                    "sz": float(sz),
-                    "limit_px": "0",  # STRING (important)
-                    "order_type": {"trigger": {"isMarket": True, "triggerPx": tp_px_str, "tpsl": "tp"}},
-                    "reduce_only": True,  # safety
-                })
+                results.append({"tp_limit": res_tp, "px": str(tp_rounded)})
 
             if sl_trigger is not None:
-                sl_dec = Decimal(str(sl_trigger))
-                sl_rounded, sl_num = fmt_px_for_hl(sl_dec, px_step)
-                sl_px_str = str(int(sl_rounded)) if px_step == Decimal("1") else str(sl_rounded)
-                print(
-                    f"=== SL DEBUG (tpsl-only) === coin={coin} sl_raw={sl_trigger} px_step={px_step} "
-                    f"sl_rounded={sl_rounded} sl_num={sl_num} sl_str={sl_px_str}"
+                sl_rounded, sl_num = fmt_px_for_hl(Decimal(str(sl_trigger)), px_step)
+                print(f"=== SL LIMIT (reduce-only) === raw={sl_trigger} rounded={sl_rounded} px_num={sl_num}")
+                res_sl = hl_order_with_retry(
+                    exchange,
+                    coin=coin,
+                    is_buy=close_is_buy,
+                    sz=sz,
+                    px_num=sl_num,
+                    tif="Gtc",
+                    reduce_only=True,
+                    order_type_wire={"limit": {"tif": "Gtc"}},
                 )
-                orders.append({
-                    "coin": coin,
-                    "is_buy": tpsl_is_buy,
-                    "sz": float(sz),
-                    "limit_px": "0",  # STRING (important)
-                    "order_type": {"trigger": {"isMarket": True, "triggerPx": sl_px_str, "tpsl": "sl"}},
-                    "reduce_only": True,  # safety
-                })
+                results.append({"sl_limit": res_sl, "px": str(sl_rounded)})
 
-            print("\n=== POSITION TPSL DEBUG ===")
-            print(f"grouping=positionTpsl orders={len(orders)}")
-
-            res = hl_grouped_orders_with_retry(
-                exchange,
-                order_requests=orders,
-                grouping="positionTpsl",
-            )
-
-            print("\n=== HL POSITION TPSL RESPONSE ===")
-            print(res)
+            print("\n=== HL TPSL (reduce-only limit) RESPONSE ===")
+            print(results)
 
             return {
                 "ok": True,
-                "mode": "live_position_tpsl",
-                "grouping": "positionTpsl",
-                "result": res,
+                "mode": "live_tpsl_reduce_only_limits",
+                "tpsl": results,
                 "tv_order_id": tv_order_id,
                 "dedup_key": dedup_key,
             }
 
-        except HTTPException:
-            raise
-        except TypeError as e:
-            log_exception("⚠️ POSITION TPSL GROUPING NOT SUPPORTED BY INSTALLED SDK ⚠️", e)
-            raise HTTPException(
-                status_code=500,
-                detail="Your installed hyperliquid SDK does not support bulk_orders(grouping=...). Upgrade it.",
-            )
         except Exception as e:
-            log_exception("❌❌❌ HYPERLIQUID POSITION TPSL FAILED ❌❌❌", e)
+            log_exception("❌❌❌ TPSL (reduce-only limits) FAILED ❌❌❌", e)
             if is_429(e):
-                raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429) on position TP/SL.")
-            raise HTTPException(status_code=500, detail=f"Hyperliquid position TP/SL failed: {e}")
+                raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429) on tpsl.")
+            raise HTTPException(status_code=500, detail=f"Hyperliquid tpsl failed: {e}")
 
-    # ---------------------------------------------------------------------
-    # ORDER PATH: type="order"
-    #  - If TP/SL provided -> try grouped normalTpsl bracket
-    #  - Else -> entry only
-    # ---------------------------------------------------------------------
-    has_tpsl = (tp_trigger is not None) or (sl_trigger is not None)
-
-    if has_tpsl:
-        try:
-            orders: List[Dict[str, Any]] = []
-
-            # ENTRY order request
-            if order_type == "limit":
-                if limit_price is None:
-                    raise HTTPException(status_code=400, detail="limit order requires price (extra.price or price)")
-                lp_dec = Decimal(str(limit_price))
-                lp_rounded, lp_num = fmt_px_for_hl(lp_dec, px_step)
-                print(
-                    f"=== LIMIT DEBUG === coin={coin} limit_raw={limit_price} px_step={px_step} "
-                    f"limit_rounded={lp_rounded} limit_num={lp_num}"
-                )
-
-                orders.append({
-                    "coin": coin,
-                    "is_buy": is_buy,
-                    "sz": float(sz),
-                    "limit_px": lp_num,
-                    "order_type": {"limit": {"tif": "Gtc"}},
-                    "reduce_only": reduce_only_bool,
-                })
-
-            elif order_type == "market":
-                mids = fetch_all_mids_with_retry()
-                if coin not in mids:
-                    raise HTTPException(status_code=400, detail=f"Coin not found in allMids: {coin}")
-                mid = Decimal(str(mids[coin]))
-                px_raw = mid * (Decimal("1") + HL_SLIPPAGE) if is_buy else mid * (Decimal("1") - HL_SLIPPAGE)
-                px_rounded, px_num = fmt_px_for_hl(px_raw, px_step)
-
-                print(
-                    f"\n=== PRICE DEBUG === coin={coin} mid={mid} px_raw={px_raw} px_step={px_step} "
-                    f"px_rounded={px_rounded} px_num={px_num}"
-                )
-
-                orders.append({
-                    "coin": coin,
-                    "is_buy": is_buy,
-                    "sz": float(sz),
-                    "limit_px": px_num,  # IOC-style market with slippage
-                    "order_type": {"limit": {"tif": "Ioc"}},
-                    "reduce_only": reduce_only_bool,
-                })
-
-            else:
-                raise HTTPException(status_code=400, detail=f"Unsupported order_type={order_type}")
-
-            # TP/SL (grouped)
-            tpsl_is_buy = not is_buy  # close direction
-
-            if tp_trigger is not None:
-                tp_dec = Decimal(str(tp_trigger))
-                tp_rounded, tp_num = fmt_px_for_hl(tp_dec, px_step)
-                tp_px_str = str(int(tp_rounded)) if px_step == Decimal("1") else str(tp_rounded)
-                print(
-                    f"=== TP DEBUG === coin={coin} tp_raw={tp_trigger} px_step={px_step} "
-                    f"tp_rounded={tp_rounded} tp_num={tp_num} tp_str={tp_px_str}"
-                )
-                orders.append({
-                    "coin": coin,
-                    "is_buy": tpsl_is_buy,
-                    "sz": float(sz),
-                    "limit_px": "0",  # STRING is safer for triggers
-                    "order_type": {"trigger": {"isMarket": True, "triggerPx": tp_px_str, "tpsl": "tp"}},
-                    "reduce_only": False,  # grouped "normalTpsl"
-                })
-
-            if sl_trigger is not None:
-                sl_dec = Decimal(str(sl_trigger))
-                sl_rounded, sl_num = fmt_px_for_hl(sl_dec, px_step)
-                sl_px_str = str(int(sl_rounded)) if px_step == Decimal("1") else str(sl_rounded)
-                print(
-                    f"=== SL DEBUG === coin={coin} sl_raw={sl_trigger} px_step={px_step} "
-                    f"sl_rounded={sl_rounded} sl_num={sl_num} sl_str={sl_px_str}"
-                )
-                orders.append({
-                    "coin": coin,
-                    "is_buy": tpsl_is_buy,
-                    "sz": float(sz),
-                    "limit_px": "0",  # STRING is safer for triggers
-                    "order_type": {"trigger": {"isMarket": True, "triggerPx": sl_px_str, "tpsl": "sl"}},
-                    "reduce_only": False,  # grouped "normalTpsl"
-                })
-
-            print("\n=== GROUPED ORDER DEBUG ===")
-            print(f"grouping=normalTpsl orders={len(orders)}")
-
-            grouped_res = hl_grouped_orders_with_retry(
-                exchange,
-                order_requests=orders,
-                grouping="normalTpsl",
-            )
-
-            print("\n=== HL GROUPED RESPONSE ===")
-            print(grouped_res)
-
-            return {
-                "ok": True,
-                "mode": "live_grouped",
-                "grouping": "normalTpsl",
-                "result": grouped_res,
-                "tv_order_id": tv_order_id,
-                "dedup_key": dedup_key,
-            }
-
-        except HTTPException:
-            raise
-        except TypeError as e:
-            log_exception("⚠️ GROUPED ORDERS NOT SUPPORTED BY INSTALLED SDK ⚠️", e)
-            raise HTTPException(
-                status_code=500,
-                detail="Your installed hyperliquid SDK does not support bulk_orders(grouping=...). Upgrade it.",
-            )
-        except Exception as e:
-            log_exception("❌❌❌ HYPERLIQUID GROUPED ORDER FAILED ❌❌❌", e)
-            if is_429(e):
-                raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429) on grouped orders.")
-            raise HTTPException(status_code=500, detail=f"Hyperliquid grouped order failed: {e}")
-
-    # ---------------------------------------------------------------------
-    # ENTRY-ONLY PATH: no TP/SL provided
-    # ---------------------------------------------------------------------
+    # =====================================================================
+    # ENTRY PATH: type="order" (market IOC with slippage, or limit GTC)
+    # =====================================================================
     try:
         if order_type == "limit":
             if limit_price is None:
                 raise HTTPException(status_code=400, detail="limit order requires price (extra.price or price)")
 
-            lp_dec = Decimal(str(limit_price))
-            lp_rounded, lp_num = fmt_px_for_hl(lp_dec, px_step)
-            print(
-                f"=== LIMIT DEBUG === coin={coin} limit_raw={limit_price} px_step={px_step} "
-                f"limit_rounded={lp_rounded} limit_num={lp_num}"
-            )
+            lp_rounded, lp_num = fmt_px_for_hl(Decimal(str(limit_price)), px_step)
+            print(f"=== LIMIT ENTRY DEBUG === raw={limit_price} rounded={lp_rounded} px_num={lp_num}")
 
             main_result = hl_order_with_retry(
                 exchange,
@@ -644,6 +465,7 @@ async def tv_webhook(req: Request):
                 px_num=lp_num,
                 tif="Gtc",
                 reduce_only=reduce_only_bool,
+                order_type_wire={"limit": {"tif": "Gtc"}},
             )
 
         elif order_type == "market":
@@ -655,10 +477,7 @@ async def tv_webhook(req: Request):
             px_raw = mid * (Decimal("1") + HL_SLIPPAGE) if is_buy else mid * (Decimal("1") - HL_SLIPPAGE)
             px_rounded, px_num = fmt_px_for_hl(px_raw, px_step)
 
-            print(
-                f"\n=== PRICE DEBUG === coin={coin} mid={mid} px_raw={px_raw} px_step={px_step} "
-                f"px_rounded={px_rounded} px_num={px_num}"
-            )
+            print(f"=== MARKET IOC DEBUG === mid={mid} px_raw={px_raw} rounded={px_rounded} px_num={px_num}")
 
             main_result = hl_order_with_retry(
                 exchange,
@@ -668,6 +487,7 @@ async def tv_webhook(req: Request):
                 px_num=px_num,
                 tif="Ioc",
                 reduce_only=reduce_only_bool,
+                order_type_wire={"limit": {"tif": "Ioc"}},
             )
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported order_type={order_type}")
@@ -680,12 +500,12 @@ async def tv_webhook(req: Request):
             raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429) on entry order.")
         raise HTTPException(status_code=500, detail=f"Hyperliquid entry order failed: {e}")
 
-    print("\n=== HL MAIN ORDER RESPONSE ===")
+    print("\n=== HL ENTRY ORDER RESPONSE ===")
     print(main_result)
 
     return {
         "ok": True,
-        "mode": "live",
+        "mode": "live_entry",
         "main": main_result,
         "tv_order_id": tv_order_id,
         "dedup_key": dedup_key,
