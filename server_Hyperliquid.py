@@ -4,7 +4,7 @@ import traceback
 import hashlib
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, ROUND_FLOOR
 from time import time, sleep
-from typing import Optional, Tuple, Union, List, Dict, Any
+from typing import Optional, Tuple, Union, Dict, Any
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
@@ -43,11 +43,11 @@ TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 # ===============================
 # HARD-CODED STEPS (to avoid meta/info calls)
 # ===============================
-# Your confirmed BTC rules:
+# BTC rules:
 # - Minimal size increment: 0.00001 BTC
-# - Price increment: 1 (no decimals)
+# - Price increment: 0.5 (common on HL)
 ASSET_STEPS = {
-    "BTC": {"sz_step": Decimal("0.00001"), "px_step": Decimal("1")},
+    "BTC": {"sz_step": Decimal("0.00001"), "px_step": Decimal("0.5")},
 }
 
 # ===============================
@@ -234,14 +234,15 @@ def hl_order_with_retry(
     is_buy: bool,
     sz: Decimal,
     px_num: Union[int, float],
-    tif: str,
+    tif: str,  # kept for compatibility (not used directly here)
     reduce_only: bool,
     order_type_wire: dict,
     max_attempts: int = 5,
 ) -> dict:
     """
     Generic order wrapper with 429 retry.
-    order_type_wire is the dict you pass as the 5th argument to exchange.order (e.g. {"limit":{"tif":"Ioc"}})
+    order_type_wire is the dict you pass as the 5th argument to exchange.order
+    (e.g. {"limit":{"tif":"Ioc"}} or {"trigger":{...}})
     """
     backoff = 1
     last_err = None
@@ -333,7 +334,7 @@ async def tv_webhook(req: Request):
 
     # TP/SL values (used only when msg_type=="tpsl")
     tp_trigger = to_decimal(extra.get("tp_trigger") or data.get("tp_trigger"))
-    sl_trigger = to_decimal(extra.get("sl") or data.get("sl"))
+    sl_trigger = to_decimal(extra.get("sl") or extra.get("sl_trigger") or data.get("sl") or data.get("sl_trigger"))
 
     # limit entry price
     limit_price = to_decimal(extra.get("price") or data.get("price"))
@@ -378,27 +379,17 @@ async def tv_webhook(req: Request):
     exchange = get_exchange()
 
     # =====================================================================
-    # APPROACH A: TPSL via SIMPLE REDUCE-ONLY ORDERS (NO grouping, NO trigger orders)
+    # TPSL PATH: TP = LIMIT reduce-only, SL = TRIGGER stop-market reduce-only
     # =====================================================================
     if msg_type == "tpsl":
         if tp_trigger is None and sl_trigger is None:
             raise HTTPException(status_code=400, detail="type=tpsl requires tp_trigger and/or sl")
 
         try:
-            # close direction (if position is long -> close sells; if short -> close buys)
-            close_is_buy = not is_buy
-
-            # HL expects reduce_only to ensure no position increase.
-            # We place TWO reduce-only LIMIT IOC orders at the target prices.
-            # This behaves like a "take profit" and "stop loss" replacement using regular reduce-only orders.
+            close_is_buy = not is_buy  # long->sell, short->buy
             results = []
 
-            # IMPORTANT:
-            # - For LONG: TP is a SELL above, SL is a SELL below (both reduce_only)
-            # - For SHORT: TP is a BUY below, SL is a BUY above (both reduce_only)
-            # No trigger mechanics here: they rest in the book until price trades through.
-            # This is the simplest stable approach on HL when trigger/grouping is unreliable.
-
+            # --- TP as LIMIT reduce-only (GTC) ---
             if tp_trigger is not None:
                 tp_rounded, tp_num = fmt_px_for_hl(Decimal(str(tp_trigger)), px_step)
                 print(f"=== TP LIMIT (reduce-only) === raw={tp_trigger} rounded={tp_rounded} px_num={tp_num}")
@@ -414,34 +405,61 @@ async def tv_webhook(req: Request):
                 )
                 results.append({"tp_limit": res_tp, "px": str(tp_rounded)})
 
+            # --- SL as STOP-MARKET TRIGGER reduce-only ---
             if sl_trigger is not None:
                 sl_rounded, sl_num = fmt_px_for_hl(Decimal(str(sl_trigger)), px_step)
-                print(f"=== SL LIMIT (reduce-only) === raw={sl_trigger} rounded={sl_rounded} px_num={sl_num}")
-                res_sl = hl_order_with_retry(
-                    exchange,
-                    coin=coin,
-                    is_buy=close_is_buy,
-                    sz=sz,
-                    px_num=sl_num,
-                    tif="Gtc",
-                    reduce_only=True,
-                    order_type_wire={"limit": {"tif": "Gtc"}},
-                )
-                results.append({"sl_limit": res_sl, "px": str(sl_rounded)})
 
-            print("\n=== HL TPSL (reduce-only limit) RESPONSE ===")
+                # Validate trigger side vs current mid to avoid HL rejecting it
+                mids = fetch_all_mids_with_retry()
+                if coin not in mids:
+                    print(f"⚠️ SL skipped: coin not found in allMids: {coin}")
+                else:
+                    mid = Decimal(str(mids[coin]))
+
+                    # For SELL close (long): sl must be below mid
+                    # For BUY close (short): sl must be above mid
+                    wrong_side = (close_is_buy is False and sl_rounded >= mid) or (close_is_buy is True and sl_rounded <= mid)
+                    if wrong_side:
+                        print(f"⚠️ SL skipped: trigger on wrong side. mid={mid} sl={sl_rounded} close_is_buy={close_is_buy}")
+                    else:
+                        print(
+                            f"=== SL STOP-MARKET (reduce-only) === raw={sl_trigger} rounded={sl_rounded} "
+                            f"mid={mid} triggerPx={float(sl_num)}"
+                        )
+
+                        # IMPORTANT for your SDK: triggerPx must be present in the trigger dict.
+                        # Use px_num=1 (dummy) instead of 0 to avoid 'invalid price' edge cases.
+                        res_sl = hl_order_with_retry(
+                            exchange,
+                            coin=coin,
+                            is_buy=close_is_buy,
+                            sz=sz,
+                            px_num=1,
+                            tif="Gtc",
+                            reduce_only=True,
+                            order_type_wire={
+                                "trigger": {
+                                    "isMarket": True,
+                                    "triggerPx": float(sl_num),
+                                    "tpsl": "sl",
+                                }
+                            },
+                        )
+                        results.append({"sl_stop_market": res_sl, "triggerPx": str(sl_rounded)})
+
+            print("\n=== HL TPSL RESPONSE (TP limit + SL stop-market) ===")
             print(results)
 
             return {
                 "ok": True,
-                "mode": "live_tpsl_reduce_only_limits",
+                "mode": "live_tpsl_tp_limit_sl_stop_market",
                 "tpsl": results,
                 "tv_order_id": tv_order_id,
                 "dedup_key": dedup_key,
             }
 
         except Exception as e:
-            log_exception("❌❌❌ TPSL (reduce-only limits) FAILED ❌❌❌", e)
+            log_exception("❌❌❌ TPSL FAILED ❌❌❌", e)
             if is_429(e):
                 raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429) on tpsl.")
             raise HTTPException(status_code=500, detail=f"Hyperliquid tpsl failed: {e}")
@@ -510,5 +528,3 @@ async def tv_webhook(req: Request):
         "tv_order_id": tv_order_id,
         "dedup_key": dedup_key,
     }
-
-
