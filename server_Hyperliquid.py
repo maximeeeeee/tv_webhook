@@ -47,7 +47,7 @@ TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 # - Minimal size increment: 0.00001 BTC
 # - Price increment: 0.5 (common on HL)
 ASSET_STEPS = {
-    "BTC": {"sz_step": Decimal("0.00001"), "px_step": Decimal("0.5")},
+    "BTC": {"sz_step": Decimal("0.00001"), "px_step": Decimal("1")},
 }
 
 # ===============================
