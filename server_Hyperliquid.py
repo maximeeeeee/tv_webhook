@@ -233,22 +233,21 @@ def hl_grouped_orders_with_retry(
     """
     Sends ALL orders in one exchange request via bulk_orders(..., grouping=...).
 
-    grouping should be:
-      - "normalTpsl" for entry + TP/SL grouped together
-      - "na" if just one order
+    grouping examples:
+      - "normalTpsl"    entry + TP/SL bracket
+      - "positionTpsl"  TP/SL attached to current position
+      - "na"            no grouping
     """
     backoff = 1
     last_err = None
 
     for attempt in range(1, max_attempts + 1):
         try:
-            # Newer SDK supports grouping parameter on bulk_orders
             return exchange.bulk_orders(order_requests, grouping=grouping)
         except TypeError as e:
-            # Older SDK: bulk_orders may not accept grouping kwarg
             last_err = e
             print("⚠️ Your installed hyperliquid SDK bulk_orders() does not accept grouping=. "
-                  "Upgrade the SDK or use the fallback path.")
+                  "Upgrade the SDK.")
             raise
         except Exception as e:
             last_err = e
@@ -296,40 +295,6 @@ def hl_order_with_retry(
     raise HTTPException(status_code=503, detail=f"Order failed after retries (last_err={last_err})")
 
 
-def hl_trigger_with_retry(
-    exchange: Exchange,
-    *,
-    coin: str,
-    is_buy: bool,
-    sz: Decimal,
-    trigger_px_num: Union[int, float],
-    tpsl: str,
-    reduce_only: bool,
-    max_attempts: int = 5,
-) -> dict:
-    backoff = 1
-    last_err = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return exchange.order(
-                coin,
-                is_buy,
-                float(sz),
-                0,  # IMPORTANT: market trigger uses 0
-                {"trigger": {"isMarket": True, "triggerPx": trigger_px_num, "tpsl": tpsl}},
-                reduce_only=reduce_only,
-            )
-        except Exception as e:
-            last_err = e
-            if is_429(e):
-                print(f"⚠️ trigger {tpsl} hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
-                sleep(backoff)
-                backoff = min(backoff * 2, 10)
-                continue
-            raise
-    raise HTTPException(status_code=503, detail=f"Trigger {tpsl} failed after retries (last_err={last_err})")
-
-
 def parse_entry_state(main_result: dict) -> Tuple[bool, bool]:
     try:
         statuses = main_result.get("response", {}).get("data", {}).get("statuses", [])
@@ -363,7 +328,8 @@ async def tv_webhook(req: Request):
     print("\n=== TradingView payload ===")
     print(data)
 
-    if data.get("type") != "order":
+    msg_type = str(data.get("type", "")).strip().lower()
+    if msg_type not in ("order", "tpsl"):
         return {"ok": True, "mode": "ignored"}
 
     extra = data.get("extra") or {}
@@ -407,7 +373,7 @@ async def tv_webhook(req: Request):
 
     print("\n=== Parsed ===")
     print(
-        f"coin={coin} is_buy={is_buy} sz={sz} order_type={order_type} reduce_only={reduce_only_bool} "
+        f"type={msg_type} coin={coin} is_buy={is_buy} sz={sz} order_type={order_type} reduce_only={reduce_only_bool} "
         f"limit_price={limit_price} tp_trigger={tp_trigger} sl_trigger={sl_trigger}"
     )
 
@@ -416,6 +382,7 @@ async def tv_webhook(req: Request):
         return {
             "ok": True,
             "mode": "safe",
+            "type": msg_type,
             "coin": coin,
             "is_buy": is_buy,
             "sz": str(sz),
@@ -443,8 +410,92 @@ async def tv_webhook(req: Request):
 
     exchange = get_exchange()
 
+    # =====================================================================
+    # TPSL-ONLY PATH (NEW): type="tpsl"
+    #  - NO ENTRY order
+    #  - Send TP/SL as position TP/SL: grouping="positionTpsl"
+    # =====================================================================
+    if msg_type == "tpsl":
+        if tp_trigger is None and sl_trigger is None:
+            raise HTTPException(status_code=400, detail="type=tpsl requires tp_trigger and/or sl")
+
+        try:
+            orders: List[Dict[str, Any]] = []
+            # For a long position: TP/SL are sells. For a short position: TP/SL are buys.
+            tpsl_is_buy = not is_buy  # close direction
+
+            if tp_trigger is not None:
+                tp_dec = Decimal(str(tp_trigger))
+                tp_rounded, tp_num = fmt_px_for_hl(tp_dec, px_step)
+                print(
+                    f"=== TP DEBUG (tpsl-only) === coin={coin} tp_raw={tp_trigger} px_step={px_step} "
+                    f"tp_rounded={tp_rounded} tp_num={tp_num}"
+                )
+                orders.append({
+                    "coin": coin,
+                    "is_buy": tpsl_is_buy,
+                    "sz": float(sz),
+                    "limit_px": 0,
+                    "order_type": {"trigger": {"isMarket": True, "triggerPx": tp_num, "tpsl": "tp"}},
+                    "reduce_only": True,  # SAFETY: never increase position
+                })
+
+            if sl_trigger is not None:
+                sl_dec = Decimal(str(sl_trigger))
+                sl_rounded, sl_num = fmt_px_for_hl(sl_dec, px_step)
+                print(
+                    f"=== SL DEBUG (tpsl-only) === coin={coin} sl_raw={sl_trigger} px_step={px_step} "
+                    f"sl_rounded={sl_rounded} sl_num={sl_num}"
+                )
+                orders.append({
+                    "coin": coin,
+                    "is_buy": tpsl_is_buy,
+                    "sz": float(sz),
+                    "limit_px": 0,
+                    "order_type": {"trigger": {"isMarket": True, "triggerPx": sl_num, "tpsl": "sl"}},
+                    "reduce_only": True,  # SAFETY
+                })
+
+            print("\n=== POSITION TPSL DEBUG ===")
+            print(f"grouping=positionTpsl orders={len(orders)}")
+
+            res = hl_grouped_orders_with_retry(
+                exchange,
+                order_requests=orders,
+                grouping="positionTpsl",
+            )
+
+            print("\n=== HL POSITION TPSL RESPONSE ===")
+            print(res)
+
+            return {
+                "ok": True,
+                "mode": "live_position_tpsl",
+                "grouping": "positionTpsl",
+                "result": res,
+                "tv_order_id": tv_order_id,
+                "dedup_key": dedup_key,
+            }
+
+        except HTTPException:
+            raise
+        except TypeError as e:
+            log_exception("⚠️ POSITION TPSL GROUPING NOT SUPPORTED BY INSTALLED SDK ⚠️", e)
+            raise HTTPException(
+                status_code=500,
+                detail="Your installed hyperliquid SDK does not support bulk_orders(grouping=...). Upgrade it.",
+            )
+        except Exception as e:
+            log_exception("❌❌❌ HYPERLIQUID POSITION TPSL FAILED ❌❌❌", e)
+            if is_429(e):
+                raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429) on position TP/SL.")
+            raise HTTPException(status_code=500, detail=f"Hyperliquid position TP/SL failed: {e}")
+
     # ---------------------------------------------------------------------
-    # GROUPED PATH: Entry + TP/SL in ONE request (bulk_orders + normalTpsl)
+    # ORDER PATH: type="order"
+    #  - Keep your existing logic:
+    #    * If TP/SL provided -> try grouped normalTpsl bracket
+    #    * Else -> entry only
     # ---------------------------------------------------------------------
     has_tpsl = (tp_trigger is not None) or (sl_trigger is not None)
 
@@ -556,7 +607,6 @@ async def tv_webhook(req: Request):
         except HTTPException:
             raise
         except TypeError as e:
-            # SDK too old for grouping kwarg on bulk_orders
             log_exception("⚠️ GROUPED ORDERS NOT SUPPORTED BY INSTALLED SDK ⚠️", e)
             raise HTTPException(
                 status_code=500,
@@ -569,7 +619,7 @@ async def tv_webhook(req: Request):
             raise HTTPException(status_code=500, detail=f"Hyperliquid grouped order failed: {e}")
 
     # ---------------------------------------------------------------------
-    # NON-GROUPED PATH: no TP/SL provided -> just place the entry as before
+    # ENTRY-ONLY PATH: no TP/SL provided
     # ---------------------------------------------------------------------
     try:
         if order_type == "limit":
