@@ -4,7 +4,7 @@ import traceback
 import hashlib
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, ROUND_FLOOR
 from time import time, sleep
-from typing import Optional, Tuple, Union, List, Dict, Any
+from typing import Optional, Tuple, Union, Dict, Any
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
@@ -43,9 +43,6 @@ TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 # ===============================
 # HARD-CODED STEPS (to avoid meta/info calls)
 # ===============================
-# Your confirmed BTC rules:
-# - Minimal size increment: 0.00001 BTC
-# - Price increment: 1 (no decimals)
 ASSET_STEPS = {
     "BTC": {"sz_step": Decimal("0.00001"), "px_step": Decimal("1")},
 }
@@ -135,13 +132,6 @@ def round_to_step_nearest(x: Decimal, step: Decimal) -> Decimal:
 
 
 def fmt_px_for_hl(px: Decimal, px_step: Decimal) -> Tuple[Decimal, Union[int, float]]:
-    """
-    Returns:
-      - rounded Decimal px_rounded
-      - numeric value for SDK:
-          * int when px_step == 1
-          * float otherwise
-    """
     px_rounded = round_to_step_nearest(px, px_step)
     if px_step == Decimal("1"):
         return px_rounded, int(px_rounded)
@@ -154,17 +144,10 @@ def is_429(e: Exception) -> bool:
 
 
 def get_exchange(max_attempts: int = 5) -> Exchange:
-    """
-    SDK Exchange() constructor can 429 because it fetches /info internally.
-    So we retry Exchange init with backoff.
-    """
     global _exchange
 
     if not HL_ACCOUNT_ADDRESS or not HL_SECRET_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Missing HL_ACCOUNT_ADDRESS or HL_SECRET_KEY in env vars",
-        )
+        raise HTTPException(status_code=500, detail="Missing HL_ACCOUNT_ADDRESS or HL_SECRET_KEY in env vars")
 
     if _exchange is not None:
         return _exchange
@@ -176,7 +159,6 @@ def get_exchange(max_attempts: int = 5) -> Exchange:
         try:
             wallet = Account.from_key(HL_SECRET_KEY)
 
-            # Support multiple SDK signatures
             try:
                 _exchange = Exchange(wallet=wallet, base_url=HL_BASE_URL, account_address=HL_ACCOUNT_ADDRESS)
             except TypeError:
@@ -191,10 +173,8 @@ def get_exchange(max_attempts: int = 5) -> Exchange:
             last_err = e
             if is_429(e):
                 print(f"⚠️ Exchange init hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
-                sleep(backoff)
-                backoff = min(backoff * 2, 10)
-                continue
-            print(f"⚠️ Exchange init failed (attempt {attempt}/{max_attempts}): {e}. Backing off {backoff}s...")
+            else:
+                print(f"⚠️ Exchange init failed (attempt {attempt}/{max_attempts}): {e}. Backing off {backoff}s...")
             sleep(backoff)
             backoff = min(backoff * 2, 10)
 
@@ -234,15 +214,10 @@ def hl_order_with_retry(
     is_buy: bool,
     sz: Decimal,
     px_num: Union[int, float],
-    tif: str,
+    order_type_wire: Dict[str, Any],
     reduce_only: bool,
-    order_type_wire: dict,
     max_attempts: int = 5,
 ) -> dict:
-    """
-    Generic order wrapper with 429 retry.
-    order_type_wire is the dict you pass as the 5th argument to exchange.order (e.g. {"limit":{"tif":"Ioc"}})
-    """
     backoff = 1
     last_err = None
 
@@ -297,7 +272,7 @@ async def tv_webhook(req: Request):
 
     extra = data.get("extra") or {}
 
-    # DEDUP KEY
+    # DEDUP
     tv_order_id = str(data.get("tv_order_id", "")).strip()
     if tv_order_id and tv_order_id not in ("Long", "Short") and len(tv_order_id) > 3:
         dedup_key = tv_order_id
@@ -327,15 +302,12 @@ async def tv_webhook(req: Request):
     if sz is None or sz <= 0:
         raise HTTPException(status_code=400, detail="Invalid qty")
 
-    # order_type (entry only)
     order_type = str(extra.get("order_type") or data.get("order_type") or "market").lower()
     reduce_only_bool = parse_bool(extra.get("reduce_only", data.get("reduce_only", False)))
 
-    # TP/SL values (used only when msg_type=="tpsl")
+    # TP/SL + entry limit price
     tp_trigger = to_decimal(extra.get("tp_trigger") or data.get("tp_trigger"))
     sl_trigger = to_decimal(extra.get("sl") or data.get("sl"))
-
-    # limit entry price
     limit_price = to_decimal(extra.get("price") or data.get("price"))
 
     print("\n=== Parsed ===")
@@ -378,76 +350,70 @@ async def tv_webhook(req: Request):
     exchange = get_exchange()
 
     # =====================================================================
-    # APPROACH A: TPSL via SIMPLE REDUCE-ONLY ORDERS (NO grouping, NO trigger orders)
+    # TPSL PATH: TP = LIMIT reduce-only, SL = TRIGGER stop-market reduce-only
     # =====================================================================
     if msg_type == "tpsl":
         if tp_trigger is None and sl_trigger is None:
             raise HTTPException(status_code=400, detail="type=tpsl requires tp_trigger and/or sl")
 
         try:
-            # close direction (if position is long -> close sells; if short -> close buys)
+            # close direction (long -> sell, short -> buy)
             close_is_buy = not is_buy
 
-            # HL expects reduce_only to ensure no position increase.
-            # We place TWO reduce-only LIMIT IOC orders at the target prices.
-            # This behaves like a "take profit" and "stop loss" replacement using regular reduce-only orders.
             results = []
 
-            # IMPORTANT:
-            # - For LONG: TP is a SELL above, SL is a SELL below (both reduce_only)
-            # - For SHORT: TP is a BUY below, SL is a BUY above (both reduce_only)
-            # No trigger mechanics here: they rest in the book until price trades through.
-            # This is the simplest stable approach on HL when trigger/grouping is unreliable.
-
+            # --- TP as LIMIT reduce-only (GTC) ---
             if tp_trigger is not None:
                 tp_rounded, tp_num = fmt_px_for_hl(Decimal(str(tp_trigger)), px_step)
                 print(f"=== TP LIMIT (reduce-only) === raw={tp_trigger} rounded={tp_rounded} px_num={tp_num}")
-                res_tp = hl_order_with_retry(
+
+                tp_res = hl_order_with_retry(
                     exchange,
                     coin=coin,
                     is_buy=close_is_buy,
                     sz=sz,
                     px_num=tp_num,
-                    tif="Gtc",
-                    reduce_only=True,
                     order_type_wire={"limit": {"tif": "Gtc"}},
+                    reduce_only=True,
                 )
-                results.append({"tp_limit": res_tp, "px": str(tp_rounded)})
+                results.append({"tp_limit": tp_res, "px": str(tp_rounded)})
 
+            # --- SL as STOP MARKET (trigger) reduce-only ---
             if sl_trigger is not None:
                 sl_rounded, sl_num = fmt_px_for_hl(Decimal(str(sl_trigger)), px_step)
-                print(f"=== SL LIMIT (reduce-only) === raw={sl_trigger} rounded={sl_rounded} px_num={sl_num}")
-                res_sl = hl_order_with_retry(
+                print(f"=== SL STOP-MARKET (reduce-only) === raw={sl_trigger} rounded={sl_rounded} triggerPx={sl_num}")
+
+                # IMPORTANT: trigger order uses px=0 and trigger dict
+                sl_res = hl_order_with_retry(
                     exchange,
                     coin=coin,
                     is_buy=close_is_buy,
                     sz=sz,
-                    px_num=sl_num,
-                    tif="Gtc",
+                    px_num=0,
+                    order_type_wire={"trigger": {"isMarket": True, "triggerPx": float(sl_num), "tpsl": "sl"}},
                     reduce_only=True,
-                    order_type_wire={"limit": {"tif": "Gtc"}},
                 )
-                results.append({"sl_limit": res_sl, "px": str(sl_rounded)})
+                results.append({"sl_stop_market": sl_res, "triggerPx": str(sl_rounded)})
 
-            print("\n=== HL TPSL (reduce-only limit) RESPONSE ===")
+            print("\n=== HL TPSL RESPONSE (TP limit + SL stop-market) ===")
             print(results)
 
             return {
                 "ok": True,
-                "mode": "live_tpsl_reduce_only_limits",
+                "mode": "live_tpsl_tp_limit_sl_stop_market",
                 "tpsl": results,
                 "tv_order_id": tv_order_id,
                 "dedup_key": dedup_key,
             }
 
         except Exception as e:
-            log_exception("❌❌❌ TPSL (reduce-only limits) FAILED ❌❌❌", e)
+            log_exception("❌❌❌ TPSL FAILED ❌❌❌", e)
             if is_429(e):
                 raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429) on tpsl.")
             raise HTTPException(status_code=500, detail=f"Hyperliquid tpsl failed: {e}")
 
     # =====================================================================
-    # ENTRY PATH: type="order" (market IOC with slippage, or limit GTC)
+    # ENTRY PATH: type="order"
     # =====================================================================
     try:
         if order_type == "limit":
@@ -463,9 +429,8 @@ async def tv_webhook(req: Request):
                 is_buy=is_buy,
                 sz=sz,
                 px_num=lp_num,
-                tif="Gtc",
-                reduce_only=reduce_only_bool,
                 order_type_wire={"limit": {"tif": "Gtc"}},
+                reduce_only=reduce_only_bool,
             )
 
         elif order_type == "market":
@@ -485,9 +450,8 @@ async def tv_webhook(req: Request):
                 is_buy=is_buy,
                 sz=sz,
                 px_num=px_num,
-                tif="Ioc",
-                reduce_only=reduce_only_bool,
                 order_type_wire={"limit": {"tif": "Ioc"}},
+                reduce_only=reduce_only_bool,
             )
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported order_type={order_type}")
