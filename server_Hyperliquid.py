@@ -43,8 +43,9 @@ TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 # ===============================
 # HARD-CODED STEPS (to avoid meta/info calls)
 # ===============================
+# IMPORTANT: BTC tick on HL is commonly 0.5 (not always 1).
 ASSET_STEPS = {
-    "BTC": {"sz_step": Decimal("0.00001"), "px_step": Decimal("1")},
+    "BTC": {"sz_step": Decimal("0.00001"), "px_step": Decimal("0.5")},
 }
 
 # ===============================
@@ -307,7 +308,7 @@ async def tv_webhook(req: Request):
 
     # TP/SL + entry limit price
     tp_trigger = to_decimal(extra.get("tp_trigger") or data.get("tp_trigger"))
-    sl_trigger = to_decimal(extra.get("sl") or data.get("sl"))
+    sl_trigger = to_decimal(extra.get("sl") or extra.get("sl_trigger") or data.get("sl") or data.get("sl_trigger"))
     limit_price = to_decimal(extra.get("price") or data.get("price"))
 
     print("\n=== Parsed ===")
@@ -359,6 +360,7 @@ async def tv_webhook(req: Request):
         try:
             # close direction (long -> sell, short -> buy)
             close_is_buy = not is_buy
+            print(f"=== EXIT SIDE === entry_is_buy={is_buy} -> close_is_buy={close_is_buy}")
 
             results = []
 
@@ -383,14 +385,19 @@ async def tv_webhook(req: Request):
                 sl_rounded, sl_num = fmt_px_for_hl(Decimal(str(sl_trigger)), px_step)
                 print(f"=== SL STOP-MARKET (reduce-only) === raw={sl_trigger} rounded={sl_rounded} triggerPx={sl_num}")
 
-                # IMPORTANT: trigger order uses px=0 and trigger dict
                 sl_res = hl_order_with_retry(
                     exchange,
                     coin=coin,
                     is_buy=close_is_buy,
                     sz=sz,
                     px_num=0,
-                    order_type_wire={"trigger": {"isMarket": True, "triggerPx": float(sl_num), "tpsl": "sl"}},
+                    order_type_wire={
+                        "trigger": {
+                            "isMarket": True,
+                            "triggerPx": float(sl_rounded),  # use the rounded Decimal directly
+                            "tpsl": "sl",
+                        }
+                    },
                     reduce_only=True,
                 )
                 results.append({"sl_stop_market": sl_res, "triggerPx": str(sl_rounded)})
