@@ -244,6 +244,23 @@ def hl_order_with_retry(
     raise HTTPException(status_code=503, detail=f"Order failed after retries (last_err={last_err})")
 
 
+def _sl_response_has_error(sl_res: dict) -> bool:
+    """
+    HL returns: {"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"..."}]}}}
+    Sometimes different shapes; we guard.
+    """
+    try:
+        resp = sl_res.get("response", {})
+        data = resp.get("data", {})
+        statuses = data.get("statuses", [])
+        if not statuses:
+            return False
+        first = statuses[0]
+        return isinstance(first, dict) and ("error" in first)
+    except Exception:
+        return False
+
+
 @app.post("/tv")
 async def tv_webhook(req: Request):
     print("\n✅✅✅ /tv HIT (request received) ✅✅✅")
@@ -385,7 +402,8 @@ async def tv_webhook(req: Request):
                 sl_rounded, sl_num = fmt_px_for_hl(Decimal(str(sl_trigger)), px_step)
                 print(f"=== SL STOP-MARKET (reduce-only) === raw={sl_trigger} rounded={sl_rounded} triggerPx={sl_num}")
 
-                sl_res = hl_order_with_retry(
+                # Attempt A (your current format): px_num=0 + triggerPx in dict
+                sl_res_a = hl_order_with_retry(
                     exchange,
                     coin=coin,
                     is_buy=close_is_buy,
@@ -394,13 +412,34 @@ async def tv_webhook(req: Request):
                     order_type_wire={
                         "trigger": {
                             "isMarket": True,
-                            "triggerPx": float(sl_rounded),  # use the rounded Decimal directly
+                            "triggerPx": float(sl_num),
                             "tpsl": "sl",
                         }
                     },
                     reduce_only=True,
                 )
-                results.append({"sl_stop_market": sl_res, "triggerPx": str(sl_rounded)})
+
+                if _sl_response_has_error(sl_res_a):
+                    print("⚠️ SL attempt A returned error; trying attempt B (px_num=triggerPx)...")
+
+                    # Attempt B: pass trigger price via px_num and omit triggerPx field
+                    sl_res_b = hl_order_with_retry(
+                        exchange,
+                        coin=coin,
+                        is_buy=close_is_buy,
+                        sz=sz,
+                        px_num=float(sl_num),
+                        order_type_wire={
+                            "trigger": {
+                                "isMarket": True,
+                                "tpsl": "sl",
+                            }
+                        },
+                        reduce_only=True,
+                    )
+                    results.append({"sl_stop_market": sl_res_b, "triggerPx": str(sl_rounded), "fmt": "B(px=triggerPx,noField)"})
+                else:
+                    results.append({"sl_stop_market": sl_res_a, "triggerPx": str(sl_rounded), "fmt": "A(px=0,triggerPx=field)"})
 
             print("\n=== HL TPSL RESPONSE (TP limit + SL stop-market) ===")
             print(results)
