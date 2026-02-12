@@ -4,7 +4,7 @@ import traceback
 import hashlib
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, ROUND_FLOOR
 from time import time, sleep
-from typing import Optional, Tuple, Union, Dict, Any
+from typing import Optional, Tuple, Union
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
@@ -57,6 +57,12 @@ _exchange: Optional[Exchange] = None
 # ===============================
 _seen = {}  # key -> ts
 DEDUP_TTL = 60  # seconds
+
+# ===============================
+# Tiny allMids cache (reduces 429)
+# ===============================
+_mids_cache = {"ts": 0.0, "data": None}
+MIDS_TTL = 1.0  # seconds
 
 
 def clean(v):
@@ -199,6 +205,11 @@ def get_exchange(max_attempts: int = 5) -> Exchange:
 
 
 def fetch_all_mids_with_retry(max_attempts: int = 5):
+    # small cache to reduce 429
+    now = time()
+    if _mids_cache["data"] is not None and (now - _mids_cache["ts"] <= MIDS_TTL):
+        return _mids_cache["data"]
+
     url = f"{HL_BASE_URL}/info"
     payload = {"type": "allMids"}
 
@@ -214,7 +225,10 @@ def fetch_all_mids_with_retry(max_attempts: int = 5):
                 backoff = min(backoff * 2, 10)
                 continue
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            _mids_cache["ts"] = time()
+            _mids_cache["data"] = data
+            return data
         except Exception as e:
             last_err = e
             print(f"⚠️ allMids fetch failed (attempt {attempt}/{max_attempts}): {e}. Backing off {backoff}s...")
@@ -231,15 +245,12 @@ def hl_order_with_retry(
     is_buy: bool,
     sz: Decimal,
     px_num: Union[int, float],
-    tif: str,  # kept for compatibility (not used directly here)
     reduce_only: bool,
     order_type_wire: dict,
     max_attempts: int = 5,
 ) -> dict:
     """
     Generic order wrapper with 429 retry.
-    order_type_wire is the dict you pass as the 5th argument to exchange.order
-    (e.g. {"limit":{"tif":"Ioc"}} or {"trigger":{...}})
     """
     backoff = 1
     last_err = None
@@ -279,6 +290,120 @@ def _resp_has_reduce_only_pos0_error(resp: dict) -> bool:
         return bool(err) and "Reduce only order would increase position" in err
     except Exception:
         return False
+
+
+def place_tpsl_triggers(
+    *,
+    exchange: Exchange,
+    coin: str,
+    is_buy_entry: bool,
+    sz: Decimal,
+    px_step: Decimal,
+    tp_trigger: Optional[Decimal],
+    sl_trigger: Optional[Decimal],
+) -> list:
+    """
+    Places:
+      - TP: trigger take-limit reduce-only (tpsl="tp", isMarket=False)
+      - SL: trigger stop-market reduce-only (tpsl="sl", isMarket=True)
+
+    Works even if position is not open yet, as long as TP does NOT instantly trigger.
+    We'll auto-nudge TP by 1 tick if mid is available and TP would be already true.
+    """
+    close_is_buy = not is_buy_entry  # close long => sell, close short => buy
+    results = []
+
+    # mid used for SL refPx (avoid 95% away rejection) + optional TP anti-instant-trigger
+    mid = None
+    mid_num = None
+    mid_rounded = None
+    try:
+        mids = fetch_all_mids_with_retry()
+        if coin in mids:
+            mid = Decimal(str(mids[coin]))
+            mid_rounded, mid_num = fmt_px_for_hl(mid, px_step)
+    except Exception as e:
+        print(f"⚠️ allMids unavailable in place_tpsl_triggers, continuing. err={e}")
+
+    # --- TP ---
+    if tp_trigger is not None:
+        tp_rounded, tp_num = fmt_px_for_hl(Decimal(str(tp_trigger)), px_step)
+
+        # Anti-instant-trigger guard (only if mid available)
+        # For long close (sell): TP triggers when price ABOVE triggerPx -> ensure tp > mid
+        # For short close (buy): TP triggers when price BELOW triggerPx -> ensure tp < mid
+        if mid is not None:
+            if close_is_buy is False and tp_rounded <= mid:
+                tp_rounded = mid + px_step
+                tp_rounded, tp_num = fmt_px_for_hl(tp_rounded, px_step)
+                print(f"ℹ️ TP nudged up to avoid instant trigger (long). new_tp={tp_rounded} mid={mid_rounded}")
+            if close_is_buy is True and tp_rounded >= mid:
+                tp_rounded = mid - px_step
+                tp_rounded, tp_num = fmt_px_for_hl(tp_rounded, px_step)
+                print(f"ℹ️ TP nudged down to avoid instant trigger (short). new_tp={tp_rounded} mid={mid_rounded}")
+
+        print(
+            f"=== TP TRIGGER TAKE-LIMIT (reduce-only) === triggerPx={tp_rounded} limitPx={tp_rounded} refPx={mid_rounded}"
+        )
+
+        last_tp = None
+        for attempt in range(1, 6):
+            res_tp = hl_order_with_retry(
+                exchange,
+                coin=coin,
+                is_buy=close_is_buy,
+                sz=sz,
+                px_num=tp_num,  # limit price when trigger fires
+                reduce_only=True,
+                order_type_wire={
+                    "trigger": {
+                        "isMarket": False,
+                        "triggerPx": float(tp_num),
+                        "tpsl": "tp",
+                    }
+                },
+            )
+            last_tp = res_tp
+
+            if _resp_has_reduce_only_pos0_error(res_tp):
+                # If somehow still instantly triggered (mid unavailable / fast move), retry a bit
+                print(f"⚠️ TP reduce-only pos=0 (attempt {attempt}/5). Retrying in 0.5s...")
+                sleep(0.5)
+                continue
+            break
+
+        results.append({"tp_trigger_take_limit": last_tp, "triggerPx": str(tp_rounded), "limitPx": str(tp_rounded)})
+
+    # --- SL ---
+    if sl_trigger is not None:
+        sl_rounded, sl_num = fmt_px_for_hl(Decimal(str(sl_trigger)), px_step)
+
+        # refPx must be near current price (best: mid). fallback: use trigger itself.
+        ref_num = mid_num if mid_num is not None else sl_num
+        ref_rounded = mid_rounded if mid_rounded is not None else sl_rounded
+
+        print(
+            f"=== SL STOP-MARKET (reduce-only) === triggerPx={sl_rounded} refPx={ref_rounded}"
+        )
+
+        res_sl = hl_order_with_retry(
+            exchange,
+            coin=coin,
+            is_buy=close_is_buy,
+            sz=sz,
+            px_num=ref_num,
+            reduce_only=True,
+            order_type_wire={
+                "trigger": {
+                    "isMarket": True,
+                    "triggerPx": float(sl_num),
+                    "tpsl": "sl",
+                }
+            },
+        )
+        results.append({"sl_stop_market": res_sl, "triggerPx": str(sl_rounded), "refPx": str(ref_rounded)})
+
+    return results
 
 
 @app.post("/tv")
@@ -344,7 +469,7 @@ async def tv_webhook(req: Request):
     order_type = str(extra.get("order_type") or data.get("order_type") or "market").lower()
     reduce_only_bool = parse_bool(extra.get("reduce_only", data.get("reduce_only", False)))
 
-    # TP/SL values (used only when msg_type=="tpsl")
+    # TP/SL values (can be used both in tpsl and in order(one-shot))
     tp_trigger = to_decimal(extra.get("tp_trigger") or data.get("tp_trigger"))
     sl_trigger = to_decimal(extra.get("sl") or extra.get("sl_trigger") or data.get("sl") or data.get("sl_trigger"))
 
@@ -391,110 +516,29 @@ async def tv_webhook(req: Request):
     exchange = get_exchange()
 
     # =====================================================================
-    # TPSL PATH:
-    # - TP = TRIGGER TAKE-LIMIT reduce-only (tpsl="tp", isMarket=False)
-    # - SL = TRIGGER STOP-MARKET reduce-only (tpsl="sl", isMarket=True)
-    #
-    # IMPORTANT CHANGE:
-    # - We do NOT skip on "wrong side". Pine controls correctness, and pending
-    #   limit entries can make mid-based checks misleading.
+    # TPSL-only path (backward compatible)
     # =====================================================================
     if msg_type == "tpsl":
         if tp_trigger is None and sl_trigger is None:
             raise HTTPException(status_code=400, detail="type=tpsl requires tp_trigger and/or sl")
 
         try:
-            close_is_buy = not is_buy  # close long => sell, close short => buy
-            results = []
+            results = place_tpsl_triggers(
+                exchange=exchange,
+                coin=coin,
+                is_buy_entry=is_buy,
+                sz=sz,
+                px_step=px_step,
+                tp_trigger=tp_trigger,
+                sl_trigger=sl_trigger,
+            )
 
-            # mid is only used as a safe refPx for SL (avoid 95% away rejection)
-            mid = None
-            mid_rounded = None
-            mid_num = None
-            try:
-                mids = fetch_all_mids_with_retry()
-                if coin in mids:
-                    mid = Decimal(str(mids[coin]))
-                    mid_rounded, mid_num = fmt_px_for_hl(mid, px_step)
-            except Exception as e:
-                # Do not fail TPSL if mids is rate-limited; just proceed with fallback refPx later.
-                print(f"⚠️ allMids unavailable, continuing without mid refPx. err={e}")
-
-            # --- TP: trigger take-limit (reduce-only) ---
-            if tp_trigger is not None:
-                tp_rounded, tp_num = fmt_px_for_hl(Decimal(str(tp_trigger)), px_step)
-                print(
-                    f"=== TP TRIGGER TAKE-LIMIT (reduce-only) === raw={tp_trigger} triggerPx={tp_rounded} "
-                    f"limitPx={tp_rounded} refPx={mid_rounded}"
-                )
-
-                last_tp = None
-                for attempt in range(1, 6):
-                    res_tp = hl_order_with_retry(
-                        exchange,
-                        coin=coin,
-                        is_buy=close_is_buy,
-                        sz=sz,
-                        px_num=tp_num,  # LIMIT price when trigger fires (take-limit)
-                        tif="Gtc",
-                        reduce_only=True,
-                        order_type_wire={
-                            "trigger": {
-                                "isMarket": False,  # take LIMIT
-                                "triggerPx": float(tp_num),
-                                "tpsl": "tp",
-                            }
-                        },
-                    )
-                    last_tp = res_tp
-
-                    if _resp_has_reduce_only_pos0_error(res_tp):
-                        print(f"⚠️ TP got reduce-only pos=0 (attempt {attempt}/5). Retrying in 0.5s...")
-                        sleep(0.5)
-                        continue
-                    break
-
-                results.append({"tp_trigger_take_limit": last_tp, "triggerPx": str(tp_rounded), "limitPx": str(tp_rounded)})
-
-            # --- SL: trigger stop-market (reduce-only) ---
-            if sl_trigger is not None:
-                sl_rounded, sl_num = fmt_px_for_hl(Decimal(str(sl_trigger)), px_step)
-
-                # refPx for HL must be near current price (to avoid ~95% away rejection).
-                # If we have mid_num, use it. Otherwise, fall back to a reasonable ref:
-                # - best effort: use current mid unavailable -> use trigger price itself.
-                ref_num = mid_num if mid_num is not None else sl_num
-                ref_rounded = mid_rounded if mid_rounded is not None else sl_rounded
-
-                print(
-                    f"=== SL STOP-MARKET (reduce-only) === raw={sl_trigger} rounded={sl_rounded} "
-                    f"refPx={ref_rounded} triggerPx={float(sl_num)}"
-                )
-
-                res_sl = hl_order_with_retry(
-                    exchange,
-                    coin=coin,
-                    is_buy=close_is_buy,
-                    sz=sz,
-                    px_num=ref_num,
-                    tif="Gtc",
-                    reduce_only=True,
-                    order_type_wire={
-                        "trigger": {
-                            "isMarket": True,  # stop MARKET
-                            "triggerPx": float(sl_num),
-                            "tpsl": "sl",
-                        }
-                    },
-                )
-                results.append({"sl_stop_market": res_sl, "triggerPx": str(sl_rounded), "refPx": str(ref_rounded)})
-
-            print("\n=== HL TPSL RESPONSE (TP trigger take-limit + SL stop-market) ===")
+            print("\n=== HL TPSL RESPONSE ===")
             print(results)
 
             return {
                 "ok": True,
-                "mode": "live_tpsl_tp_trigger_take_limit_sl_stop_market",
+                "mode": "live_tpsl",
                 "tpsl": results,
                 "tv_order_id": tv_order_id,
                 "dedup_key": dedup_key,
@@ -507,8 +551,9 @@ async def tv_webhook(req: Request):
             raise HTTPException(status_code=500, detail=f"Hyperliquid tpsl failed: {e}")
 
     # =====================================================================
-    # ENTRY PATH: type="order" (market IOC with slippage, or limit GTC)
+    # ENTRY path: place entry, then (optional) place TP/SL in the same webhook
     # =====================================================================
+    main_result = None
     try:
         if order_type == "limit":
             if limit_price is None:
@@ -523,7 +568,6 @@ async def tv_webhook(req: Request):
                 is_buy=is_buy,
                 sz=sz,
                 px_num=lp_num,
-                tif="Gtc",
                 reduce_only=reduce_only_bool,
                 order_type_wire={"limit": {"tif": "Gtc"}},
             )
@@ -545,7 +589,6 @@ async def tv_webhook(req: Request):
                 is_buy=is_buy,
                 sz=sz,
                 px_num=px_num,
-                tif="Ioc",
                 reduce_only=reduce_only_bool,
                 order_type_wire={"limit": {"tif": "Ioc"}},
             )
@@ -563,10 +606,31 @@ async def tv_webhook(req: Request):
     print("\n=== HL ENTRY ORDER RESPONSE ===")
     print(main_result)
 
+    # One-shot: if tp/sl present in the same "order" payload, place them now
+    tpsl_results = None
+    if tp_trigger is not None or sl_trigger is not None:
+        try:
+            tpsl_results = place_tpsl_triggers(
+                exchange=exchange,
+                coin=coin,
+                is_buy_entry=is_buy,
+                sz=sz,
+                px_step=px_step,
+                tp_trigger=tp_trigger,
+                sl_trigger=sl_trigger,
+            )
+            print("\n=== HL ONE-SHOT TPSL RESPONSE ===")
+            print(tpsl_results)
+        except Exception as e:
+            # If you want hard-fail here, raise. For now we return entry ok + tpsl error.
+            log_exception("⚠️ ONE-SHOT TPSL FAILED (entry already placed) ⚠️", e)
+            tpsl_results = [{"error": str(e)}]
+
     return {
         "ok": True,
-        "mode": "live_entry",
+        "mode": "live_entry" if tpsl_results is None else "live_entry_plus_tpsl",
         "main": main_result,
+        "tpsl": tpsl_results,
         "tv_order_id": tv_order_id,
         "dedup_key": dedup_key,
     }
