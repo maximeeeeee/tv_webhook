@@ -43,9 +43,6 @@ TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 # ===============================
 # HARD-CODED STEPS (to avoid meta/info calls)
 # ===============================
-# BTC rules:
-# - Minimal size increment: 0.00001 BTC
-# - Price increment: 0.5 (common on HL)
 ASSET_STEPS = {
     "BTC": {"sz_step": Decimal("0.00001"), "px_step": Decimal("1")},
 }
@@ -227,6 +224,50 @@ def fetch_all_mids_with_retry(max_attempts: int = 5):
     raise HTTPException(status_code=503, detail=f"Failed to fetch allMids after retries: {last_err}")
 
 
+def fetch_user_state_with_retry(max_attempts: int = 5):
+    """
+    Fetch userState via /info (HTTP) so we can know if a position is currently open.
+    This lets us *not* skip TP/SL for pending limit entries (pos=0).
+    """
+    url = f"{HL_BASE_URL}/info"
+    payload = {"type": "userState", "user": HL_ACCOUNT_ADDRESS}
+
+    backoff = 1
+    last_err = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.post(url, json=payload, timeout=8)
+            if r.status_code == 429:
+                print(f"⚠️ userState hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
+                sleep(backoff)
+                backoff = min(backoff * 2, 10)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            print(f"⚠️ userState fetch failed (attempt {attempt}/{max_attempts}): {e}. Backing off {backoff}s...")
+            sleep(backoff)
+            backoff = min(backoff * 2, 10)
+
+    raise HTTPException(status_code=503, detail=f"Failed to fetch userState after retries: {last_err}")
+
+
+def get_pos_szi_from_user_state(user_state: dict, coin: str) -> Decimal:
+    """
+    Returns signed position size (szi). 0 => no open position.
+    """
+    try:
+        for ap in user_state.get("assetPositions", []):
+            pos = ap.get("position", {})
+            if pos.get("coin") == coin:
+                return Decimal(str(pos.get("szi", "0")))
+    except Exception:
+        pass
+    return Decimal("0")
+
+
 def hl_order_with_retry(
     exchange: Exchange,
     *,
@@ -395,6 +436,8 @@ async def tv_webhook(req: Request):
 
     # =====================================================================
     # TPSL PATH: TP = TRIGGER TAKE-LIMIT reduce-only, SL = TRIGGER stop-market reduce-only
+    # NOTE: "wrong-side" TP/SL validation ONLY when position is actually open.
+    #       If pos is not open yet (pending limit entry), we still place the triggers.
     # =====================================================================
     if msg_type == "tpsl":
         if tp_trigger is None and sl_trigger is None:
@@ -404,7 +447,7 @@ async def tv_webhook(req: Request):
             close_is_buy = not is_buy  # long->sell, short->buy
             results = []
 
-            # We fetch mid once and reuse it for validations + refPx
+            # Mid for validations/refPx
             mids = fetch_all_mids_with_retry()
             if coin not in mids:
                 print(f"⚠️ TPSL: coin not found in allMids: {coin}")
@@ -415,25 +458,29 @@ async def tv_webhook(req: Request):
                 mid = Decimal(str(mids[coin]))
                 mid_rounded, mid_num = fmt_px_for_hl(mid, px_step)
 
+            # Position state (to decide if we should enforce wrong-side checks)
+            user_state = fetch_user_state_with_retry()
+            pos_szi = get_pos_szi_from_user_state(user_state, coin)
+            pos_open = (pos_szi != 0)
+            print(f"=== POSITION CHECK === coin={coin} szi={pos_szi} pos_open={pos_open}")
+
             # --- TP as TRIGGER TAKE-LIMIT reduce-only (tpsl="tp", isMarket=False) ---
             if tp_trigger is not None:
                 tp_rounded, tp_num = fmt_px_for_hl(Decimal(str(tp_trigger)), px_step)
 
-                # Optional validation (avoid obvious wrong-side triggers)
+                # Wrong-side TP check ONLY when pos_open=True
                 if mid is not None:
                     # For SELL close (long): TP should be above mid
                     # For BUY close (short): TP should be below mid
                     wrong_side_tp = (close_is_buy is False and tp_rounded <= mid) or (close_is_buy is True and tp_rounded >= mid)
-                    if wrong_side_tp:
-                        print(f"⚠️ TP skipped: trigger on wrong side. mid={mid} tp={tp_rounded} close_is_buy={close_is_buy}")
+                    if pos_open and wrong_side_tp:
+                        print(f"⚠️ TP skipped (pos open): wrong side. mid={mid} tp={tp_rounded} close_is_buy={close_is_buy}")
                     else:
                         print(
                             f"=== TP TRIGGER TAKE-LIMIT (reduce-only) === raw={tp_trigger} triggerPx={tp_rounded} "
-                            f"limitPx={tp_rounded} refPx={mid_rounded}"
+                            f"limitPx={tp_rounded} refPx={mid_rounded} pos_open={pos_open}"
                         )
 
-                        # Note: for trigger-limit, SDK 'px_num' is the LIMIT price (p).
-                        # If HL still complains reduce-only while pos=0, retry briefly.
                         last_tp = None
                         for attempt in range(1, 6):
                             res_tp = hl_order_with_retry(
@@ -446,7 +493,7 @@ async def tv_webhook(req: Request):
                                 reduce_only=True,
                                 order_type_wire={
                                     "trigger": {
-                                        "isMarket": False,         # take LIMIT
+                                        "isMarket": False,
                                         "triggerPx": float(tp_num),
                                         "tpsl": "tp",
                                     }
@@ -458,14 +505,12 @@ async def tv_webhook(req: Request):
                                 print(f"⚠️ TP got reduce-only pos=0 (attempt {attempt}/5). Retrying in 0.5s...")
                                 sleep(0.5)
                                 continue
-
                             break
 
                         results.append({"tp_trigger_take_limit": last_tp, "triggerPx": str(tp_rounded), "limitPx": str(tp_rounded)})
-
                 else:
-                    # No mid available -> still try (no side validation)
-                    print(f"=== TP TRIGGER TAKE-LIMIT (reduce-only) === raw={tp_trigger} triggerPx={tp_rounded} limitPx={tp_rounded}")
+                    # No mid -> no validation
+                    print(f"=== TP TRIGGER TAKE-LIMIT (reduce-only) === raw={tp_trigger} triggerPx={tp_rounded} limitPx={tp_rounded} pos_open={pos_open}")
                     res_tp = hl_order_with_retry(
                         exchange,
                         coin=coin,
@@ -484,32 +529,32 @@ async def tv_webhook(req: Request):
                     )
                     results.append({"tp_trigger_take_limit": res_tp, "triggerPx": str(tp_rounded), "limitPx": str(tp_rounded)})
 
-            # --- SL as STOP-MARKET TRIGGER reduce-only (unchanged) ---
+            # --- SL as STOP-MARKET TRIGGER reduce-only ---
             if sl_trigger is not None:
                 sl_rounded, sl_num = fmt_px_for_hl(Decimal(str(sl_trigger)), px_step)
 
                 if mid is None:
                     print(f"⚠️ SL skipped: coin not found in allMids: {coin}")
                 else:
+                    # Wrong-side SL check ONLY when pos_open=True
                     # For SELL close (long): sl must be below mid
                     # For BUY close (short): sl must be above mid
-                    wrong_side = (close_is_buy is False and sl_rounded >= mid) or (close_is_buy is True and sl_rounded <= mid)
-                    if wrong_side:
-                        print(f"⚠️ SL skipped: trigger on wrong side. mid={mid} sl={sl_rounded} close_is_buy={close_is_buy}")
+                    wrong_side_sl = (close_is_buy is False and sl_rounded >= mid) or (close_is_buy is True and sl_rounded <= mid)
+
+                    if pos_open and wrong_side_sl:
+                        print(f"⚠️ SL skipped (pos open): wrong side. mid={mid} sl={sl_rounded} close_is_buy={close_is_buy}")
                     else:
                         print(
                             f"=== SL STOP-MARKET (reduce-only) === raw={sl_trigger} rounded={sl_rounded} "
-                            f"mid={mid_rounded} triggerPx={float(sl_num)}"
+                            f"mid={mid_rounded} triggerPx={float(sl_num)} pos_open={pos_open}"
                         )
 
-                        # IMPORTANT: For HL, px_num must be within ~95% of reference price.
-                        # Using a price near mid as px_num avoids "95% away" rejection.
                         res_sl = hl_order_with_retry(
                             exchange,
                             coin=coin,
                             is_buy=close_is_buy,
                             sz=sz,
-                            px_num=mid_num,
+                            px_num=mid_num,  # reference near mid avoids 95% rejection
                             tif="Gtc",
                             reduce_only=True,
                             order_type_wire={
