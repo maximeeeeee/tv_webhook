@@ -34,7 +34,10 @@ HL_BASE_URL = os.getenv("HL_BASE_URL", constants.MAINNET_API_URL).rstrip("/")
 # LIVE / SAFE MODE
 HL_LIVE_TRADING = os.getenv("HL_LIVE_TRADING", "false").lower() == "true"
 
-# (Kept for backward-compat / future use, but NOT used for native market)
+# Market slippage for SDK market_open (default 2% for "do not miss fills")
+HL_MARKET_SLIPPAGE = float(os.getenv("HL_MARKET_SLIPPAGE", "0.02"))
+
+# Kept for backward-compat / future use
 HL_SLIPPAGE = Decimal(os.getenv("HL_SLIPPAGE", "0.01"))
 
 # Skip rules
@@ -249,6 +252,39 @@ def hl_order_with_retry(
     raise HTTPException(status_code=503, detail=f"Order failed after retries (last_err={last_err})")
 
 
+def hl_market_open_with_retry(
+    exchange: Exchange,
+    *,
+    coin: str,
+    is_buy: bool,
+    sz: Decimal,
+    slippage: float,
+    max_attempts: int = 5,
+) -> dict:
+    """
+    Uses the official SDK "market_open" which implements market via aggressive IOC limit internally.
+    This is the correct way for this SDK (order() does not accept {"market":{}}).
+    """
+    backoff = 1
+    last_err = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # Signature per HL example:
+            # exchange.market_open(coin, is_buy, sz, limit_px=None, slippage=0.01)
+            return exchange.market_open(coin, is_buy, float(sz), None, float(slippage))
+        except Exception as e:
+            last_err = e
+            if is_429(e):
+                print(f"⚠️ market_open hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
+                sleep(backoff)
+                backoff = min(backoff * 2, 10)
+                continue
+            raise
+
+    raise HTTPException(status_code=503, detail=f"market_open failed after retries (last_err={last_err})")
+
+
 def place_tp_sl_triggers(
     exchange: Exchange,
     *,
@@ -267,7 +303,6 @@ def place_tp_sl_triggers(
     """
     results = []
 
-    # close side (if entry is buy=long, close is sell => close_is_buy False)
     close_is_buy = not entry_is_buy
 
     mids = fetch_all_mids_with_retry()
@@ -280,11 +315,7 @@ def place_tp_sl_triggers(
         mid = Decimal(str(mids[coin]))
         mid_rounded, mid_num = fmt_px_for_hl(mid, px_step)
 
-    # ------------------------
-    # TP trigger take-limit
-    # ------------------------
     if tp_trigger is not None:
-        # fallback: if tp_limit not provided, use tp_trigger
         tp_limit = tp_limit if tp_limit is not None else tp_trigger
 
         tpTrig_rounded, tpTrig_num = fmt_px_for_hl(Decimal(str(tp_trigger)), px_step)
@@ -311,7 +342,7 @@ def place_tp_sl_triggers(
             reduce_only=True,
             order_type_wire={
                 "trigger": {
-                    "isMarket": False,  # TAKE LIMIT
+                    "isMarket": False,
                     "triggerPx": float(tpTrig_num),
                     "tpsl": "tp",
                 }
@@ -326,9 +357,6 @@ def place_tp_sl_triggers(
             }
         )
 
-    # ------------------------
-    # SL trigger stop-market
-    # ------------------------
     if sl_trigger is not None:
         sl_rounded, sl_num = fmt_px_for_hl(Decimal(str(sl_trigger)), px_step)
 
@@ -340,7 +368,6 @@ def place_tp_sl_triggers(
                 f"triggerPx={sl_rounded} refPx={mid_rounded}"
             )
 
-            # IMPORTANT: HL wants px_num reasonably close to reference. Use mid as px_num.
             res_sl = hl_order_with_retry(
                 exchange,
                 coin=coin,
@@ -398,7 +425,6 @@ async def tv_webhook(req: Request):
 
     extra = data.get("extra") or {}
 
-    # DEDUP KEY
     tv_order_id = str(data.get("tv_order_id", "")).strip()
     if tv_order_id and tv_order_id not in ("Long", "Short") and len(tv_order_id) > 3:
         dedup_key = tv_order_id
@@ -428,16 +454,13 @@ async def tv_webhook(req: Request):
     if sz is None or sz <= 0:
         raise HTTPException(status_code=400, detail="Invalid qty")
 
-    # order_type (entry only)
     order_type = str(extra.get("order_type") or data.get("order_type") or "market").lower()
     reduce_only_bool = parse_bool(extra.get("reduce_only", data.get("reduce_only", False)))
 
-    # TP/SL values
     tp_trigger = to_decimal(extra.get("tp_trigger") or data.get("tp_trigger"))
     tp_limit = to_decimal(extra.get("tp_limit") or data.get("tp_limit"))
     sl_trigger = to_decimal(extra.get("sl") or extra.get("sl_trigger") or data.get("sl") or data.get("sl_trigger"))
 
-    # limit entry price
     limit_price = to_decimal(extra.get("price") or data.get("price"))
 
     print("\n=== Parsed ===")
@@ -470,7 +493,6 @@ async def tv_webhook(req: Request):
     sz_step = steps["sz_step"]
     px_step = steps["px_step"]
 
-    # round size (floor)
     sz_rounded = round_to_step_floor(sz, sz_step)
     if sz_rounded <= 0:
         raise HTTPException(status_code=400, detail=f"Qty too small after rounding to sz_step={sz_step}")
@@ -480,9 +502,6 @@ async def tv_webhook(req: Request):
 
     exchange = get_exchange()
 
-    # =====================================================================
-    # TPSL-only PATH
-    # =====================================================================
     if msg_type == "tpsl":
         if tp_trigger is None and sl_trigger is None:
             raise HTTPException(status_code=400, detail="type=tpsl requires tp_trigger and/or sl")
@@ -517,10 +536,7 @@ async def tv_webhook(req: Request):
             raise HTTPException(status_code=500, detail=f"Hyperliquid tpsl failed: {e}")
 
     # =====================================================================
-    # ENTRY PATH: type="order"
-    # - limit GTC
-    # - market (NATIVE)  ✅✅✅
-    # - if tp_trigger/sl provided => also place TP/SL triggers (one-shot)
+    # ENTRY PATH
     # =====================================================================
     try:
         if order_type == "limit":
@@ -542,20 +558,15 @@ async def tv_webhook(req: Request):
             )
 
         elif order_type == "market":
-            # ✅✅✅ TRUE MARKET ORDER (no IOC, no price cap)
-            print("=== TRUE MARKET DEBUG === sending native market order")
+            # ✅ Official SDK market order
+            print(f"=== MARKET OPEN (SDK) === slippage={HL_MARKET_SLIPPAGE}")
 
-            # Some SDK versions validate px_num even for market. Use a harmless value.
-            # If your SDK accepts 0, you can switch to 0; 1 is usually safe.
-            main_result = hl_order_with_retry(
+            main_result = hl_market_open_with_retry(
                 exchange,
                 coin=coin,
                 is_buy=is_buy,
                 sz=sz,
-                px_num=1,
-                tif="",
-                reduce_only=reduce_only_bool,
-                order_type_wire={"market": {}},
+                slippage=HL_MARKET_SLIPPAGE,
             )
 
         else:
@@ -572,7 +583,6 @@ async def tv_webhook(req: Request):
     print("\n=== HL ENTRY ORDER RESPONSE ===")
     print(main_result)
 
-    # ONE-SHOT: also place TP/SL triggers if provided
     one_shot_results = []
     if tp_trigger is not None or sl_trigger is not None:
         try:
