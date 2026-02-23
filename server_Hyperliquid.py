@@ -34,8 +34,8 @@ HL_BASE_URL = os.getenv("HL_BASE_URL", constants.MAINNET_API_URL).rstrip("/")
 # LIVE / SAFE MODE
 HL_LIVE_TRADING = os.getenv("HL_LIVE_TRADING", "false").lower() == "true"
 
-# Market slippage tolerance (used for market-style IOC pricing)
-HL_SLIPPAGE = Decimal(os.getenv("HL_SLIPPAGE", "0.01"))  # 1% default
+# (Kept for backward-compat / future use, but NOT used for native market)
+HL_SLIPPAGE = Decimal(os.getenv("HL_SLIPPAGE", "0.01"))
 
 # Skip rules
 TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
@@ -301,9 +301,6 @@ def place_tp_sl_triggers(
                 f"triggerPx={tpTrig_rounded} limitPx={tpLim_rounded}"
             )
 
-        # NOTE:
-        # - In HL SDK trigger orders: px_num is the LIMIT price (p).
-        # - triggerPx is set inside order_type_wire.
         res_tp = hl_order_with_retry(
             exchange,
             coin=coin,
@@ -314,7 +311,7 @@ def place_tp_sl_triggers(
             reduce_only=True,
             order_type_wire={
                 "trigger": {
-                    "isMarket": False,            # TAKE LIMIT
+                    "isMarket": False,  # TAKE LIMIT
                     "triggerPx": float(tpTrig_num),
                     "tpsl": "tp",
                 }
@@ -437,7 +434,7 @@ async def tv_webhook(req: Request):
 
     # TP/SL values
     tp_trigger = to_decimal(extra.get("tp_trigger") or data.get("tp_trigger"))
-    tp_limit = to_decimal(extra.get("tp_limit") or data.get("tp_limit"))  # NEW
+    tp_limit = to_decimal(extra.get("tp_limit") or data.get("tp_limit"))
     sl_trigger = to_decimal(extra.get("sl") or extra.get("sl_trigger") or data.get("sl") or data.get("sl_trigger"))
 
     # limit entry price
@@ -494,7 +491,7 @@ async def tv_webhook(req: Request):
             results = place_tp_sl_triggers(
                 exchange,
                 coin=coin,
-                entry_is_buy=is_buy,        # interpret is_buy as "entry side" for consistency with earlier design
+                entry_is_buy=is_buy,
                 sz=sz,
                 px_step=px_step,
                 tp_trigger=tp_trigger,
@@ -521,7 +518,8 @@ async def tv_webhook(req: Request):
 
     # =====================================================================
     # ENTRY PATH: type="order"
-    # - market IOC with slippage, or limit GTC
+    # - limit GTC
+    # - market (NATIVE)  ✅✅✅
     # - if tp_trigger/sl provided => also place TP/SL triggers (one-shot)
     # =====================================================================
     try:
@@ -544,26 +542,22 @@ async def tv_webhook(req: Request):
             )
 
         elif order_type == "market":
-            mids = fetch_all_mids_with_retry()
-            if coin not in mids:
-                raise HTTPException(status_code=400, detail=f"Coin not found in allMids: {coin}")
+            # ✅✅✅ TRUE MARKET ORDER (no IOC, no price cap)
+            print("=== TRUE MARKET DEBUG === sending native market order")
 
-            mid = Decimal(str(mids[coin]))
-            px_raw = mid * (Decimal("1") + HL_SLIPPAGE) if is_buy else mid * (Decimal("1") - HL_SLIPPAGE)
-            px_rounded, px_num = fmt_px_for_hl(px_raw, px_step)
-
-            print(f"=== MARKET IOC DEBUG === mid={mid} px_raw={px_raw} rounded={px_rounded} px_num={px_num}")
-
+            # Some SDK versions validate px_num even for market. Use a harmless value.
+            # If your SDK accepts 0, you can switch to 0; 1 is usually safe.
             main_result = hl_order_with_retry(
                 exchange,
                 coin=coin,
                 is_buy=is_buy,
                 sz=sz,
-                px_num=px_num,
-                tif="Ioc",
+                px_num=1,
+                tif="",
                 reduce_only=reduce_only_bool,
-                order_type_wire={"limit": {"tif": "Ioc"}},
+                order_type_wire={"market": {}},
             )
+
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported order_type={order_type}")
 
@@ -596,7 +590,6 @@ async def tv_webhook(req: Request):
             print(one_shot_results)
         except Exception as e:
             log_exception("❌❌❌ ONE-SHOT TPSL FAILED ❌❌❌", e)
-            # If you want: return 200 OK but include error; for now keep failure visible
             raise HTTPException(status_code=500, detail=f"Hyperliquid one-shot tpsl failed: {e}")
 
     return {
