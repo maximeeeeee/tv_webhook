@@ -11,55 +11,31 @@ from fastapi import FastAPI, Request, HTTPException
 
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
-
-# NOTE: If you get "ModuleNotFoundError: eth_account", add "eth-account" to requirements.txt.
 from eth_account import Account
 
 app = FastAPI()
 
-# ===============================
-# TradingView security
-# ===============================
 TV_WEBHOOK_TOKEN = os.getenv("TV_WEBHOOK_TOKEN", "CHANGE_ME")
 
-# ===============================
-# Hyperliquid credentials
-# ===============================
 HL_ACCOUNT_ADDRESS = os.getenv("HL_ACCOUNT_ADDRESS", "")
 HL_SECRET_KEY = os.getenv("HL_SECRET_KEY", "")
 
-# Mainnet by default
 HL_BASE_URL = os.getenv("HL_BASE_URL", constants.MAINNET_API_URL).rstrip("/")
-
-# LIVE / SAFE MODE
 HL_LIVE_TRADING = os.getenv("HL_LIVE_TRADING", "false").lower() == "true"
 
-# Market slippage for SDK market_open (default 2% for "do not miss fills")
 HL_MARKET_SLIPPAGE = float(os.getenv("HL_MARKET_SLIPPAGE", "0.02"))
-
-# Kept for backward-compat / future use
 HL_SLIPPAGE = Decimal(os.getenv("HL_SLIPPAGE", "0.01"))
 
-# Skip rules
 TV_SKIP_ORDER_IDS = {"Exit Long", "Exit Short"}
 
-# ===============================
-# HARD-CODED STEPS (to avoid meta/info calls)
-# ===============================
 ASSET_STEPS = {
     "BTC": {"sz_step": Decimal("0.00001"), "px_step": Decimal("1")},
 }
 
-# ===============================
-# Lazy init Exchange (SDK still calls /info internally on init => retry)
-# ===============================
 _exchange: Optional[Exchange] = None
 
-# ===============================
-# Idempotency (prevents TV retry duplicates)
-# ===============================
-_seen = {}  # key -> ts
-DEDUP_TTL = 60  # seconds
+_seen = {}
+DEDUP_TTL = 60
 
 
 def clean(v):
@@ -146,6 +122,17 @@ def is_429(e: Exception) -> bool:
     return "429" in msg or "rate" in msg.lower()
 
 
+def extract_filled_size(order_response) -> Optional[Decimal]:
+    try:
+        statuses = order_response.get("response", {}).get("data", {}).get("statuses", [])
+        for status in statuses:
+            if "filled" in status:
+                return Decimal(str(status["filled"]["totalSz"]))
+    except Exception:
+        return None
+    return None
+
+
 def get_exchange(max_attempts: int = 10) -> Exchange:
     global _exchange
 
@@ -177,14 +164,10 @@ def get_exchange(max_attempts: int = 10) -> Exchange:
 
         except Exception as e:
             last_err = e
-            if is_429(e):
-                print(f"⚠️ Exchange init hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
+            print(f"⚠️ Exchange init failed (attempt {attempt}/{max_attempts}): {e}. Backing off {backoff}s...")
+            if attempt < max_attempts:
                 sleep(backoff)
                 backoff = min(backoff * 2, 10)
-                continue
-            print(f"⚠️ Exchange init failed (attempt {attempt}/{max_attempts}): {e}. Backing off {backoff}s...")
-            sleep(backoff)
-            backoff = min(backoff * 2, 10)
 
     raise HTTPException(status_code=503, detail=f"Failed to init Exchange after retries: {last_err}")
 
@@ -201,16 +184,20 @@ def fetch_all_mids_with_retry(max_attempts: int = 10):
             r = requests.post(url, json=payload, timeout=8)
             if r.status_code == 429:
                 print(f"⚠️ allMids hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
-                sleep(backoff)
-                backoff = min(backoff * 2, 10)
+                if attempt < max_attempts:
+                    sleep(backoff)
+                    backoff = min(backoff * 2, 10)
                 continue
+
             r.raise_for_status()
             return r.json()
+
         except Exception as e:
             last_err = e
             print(f"⚠️ allMids fetch failed (attempt {attempt}/{max_attempts}): {e}. Backing off {backoff}s...")
-            sleep(backoff)
-            backoff = min(backoff * 2, 10)
+            if attempt < max_attempts:
+                sleep(backoff)
+                backoff = min(backoff * 2, 10)
 
     raise HTTPException(status_code=503, detail=f"Failed to fetch allMids after retries: {last_err}")
 
@@ -244,8 +231,9 @@ def hl_order_with_retry(
             last_err = e
             if is_429(e):
                 print(f"⚠️ order hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
-                sleep(backoff)
-                backoff = min(backoff * 2, 10)
+                if attempt < max_attempts:
+                    sleep(backoff)
+                    backoff = min(backoff * 2, 10)
                 continue
             raise
 
@@ -261,28 +249,54 @@ def hl_market_open_with_retry(
     slippage: float,
     max_attempts: int = 10,
 ) -> dict:
-    """
-    Uses the official SDK "market_open" which implements market via aggressive IOC limit internally.
-    This is the correct way for this SDK (order() does not accept {"market":{}}).
-    """
     backoff = 1
     last_err = None
 
     for attempt in range(1, max_attempts + 1):
         try:
-            # Signature per HL example:
-            # exchange.market_open(coin, is_buy, sz, limit_px=None, slippage=0.01)
             return exchange.market_open(coin, is_buy, float(sz), None, float(slippage))
         except Exception as e:
             last_err = e
             if is_429(e):
                 print(f"⚠️ market_open hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
-                sleep(backoff)
-                backoff = min(backoff * 2, 10)
+                if attempt < max_attempts:
+                    sleep(backoff)
+                    backoff = min(backoff * 2, 10)
                 continue
             raise
 
     raise HTTPException(status_code=503, detail=f"market_open failed after retries (last_err={last_err})")
+
+
+def hl_market_close_with_retry(
+    exchange: Exchange,
+    *,
+    coin: str,
+    slippage: float,
+    max_attempts: int = 10,
+) -> dict:
+    backoff = 1
+    last_err = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"🚨 EMERGENCY MARKET CLOSE === coin={coin} slippage={slippage}")
+            try:
+                return exchange.market_close(coin, slippage=float(slippage))
+            except TypeError:
+                return exchange.market_close(coin)
+
+        except Exception as e:
+            last_err = e
+            if is_429(e):
+                print(f"⚠️ market_close hit 429 (attempt {attempt}/{max_attempts}). Backing off {backoff}s...")
+                if attempt < max_attempts:
+                    sleep(backoff)
+                    backoff = min(backoff * 2, 10)
+                continue
+            raise
+
+    raise HTTPException(status_code=503, detail=f"market_close failed after retries (last_err={last_err})")
 
 
 def place_tp_sl_triggers(
@@ -296,11 +310,6 @@ def place_tp_sl_triggers(
     tp_limit: Optional[Decimal],
     sl_trigger: Optional[Decimal],
 ) -> list:
-    """
-    Places:
-      - TP as trigger TAKE-LIMIT (reduce-only): triggerPx = tp_trigger, limitPx = tp_limit (fallback tp_trigger)
-      - SL as trigger stop-market (reduce-only): triggerPx = sl_trigger
-    """
     results = []
 
     close_is_buy = not entry_is_buy
@@ -535,9 +544,6 @@ async def tv_webhook(req: Request):
                 raise HTTPException(status_code=503, detail="Hyperliquid rate limited (429) on tpsl.")
             raise HTTPException(status_code=500, detail=f"Hyperliquid tpsl failed: {e}")
 
-    # =====================================================================
-    # ENTRY PATH
-    # =====================================================================
     try:
         if order_type == "limit":
             if limit_price is None:
@@ -558,7 +564,6 @@ async def tv_webhook(req: Request):
             )
 
         elif order_type == "market":
-            # ✅ Official SDK market order
             print(f"=== MARKET OPEN (SDK) === slippage={HL_MARKET_SLIPPAGE}")
 
             main_result = hl_market_open_with_retry(
@@ -583,29 +588,79 @@ async def tv_webhook(req: Request):
     print("\n=== HL ENTRY ORDER RESPONSE ===")
     print(main_result)
 
+    filled_size = extract_filled_size(main_result)
+
+    if filled_size is None:
+        print("⚠️ ENTRY NOT FILLED — no TP/SL will be placed.")
+        return {
+            "ok": True,
+            "mode": "live_entry_not_filled",
+            "main": main_result,
+            "tpsl": None,
+            "tv_order_id": tv_order_id,
+            "dedup_key": dedup_key,
+        }
+
+    print(f"✅ ENTRY FILLED SIZE === {filled_size}")
+
     one_shot_results = []
+
     if tp_trigger is not None or sl_trigger is not None:
         try:
             one_shot_results = place_tp_sl_triggers(
                 exchange,
                 coin=coin,
                 entry_is_buy=is_buy,
-                sz=sz,
+                sz=filled_size,
                 px_step=px_step,
                 tp_trigger=tp_trigger,
                 tp_limit=tp_limit,
                 sl_trigger=sl_trigger,
             )
+
             print("=== HL ONE-SHOT TPSL RESPONSE ===")
             print(one_shot_results)
+
         except Exception as e:
-            log_exception("❌❌❌ ONE-SHOT TPSL FAILED ❌❌❌", e)
-            raise HTTPException(status_code=500, detail=f"Hyperliquid one-shot tpsl failed: {e}")
+            log_exception("❌❌❌ ONE-SHOT TPSL FAILED — EMERGENCY CLOSE REQUIRED ❌❌❌", e)
+
+            emergency_close_result = None
+
+            try:
+                emergency_close_result = hl_market_close_with_retry(
+                    exchange,
+                    coin=coin,
+                    slippage=HL_MARKET_SLIPPAGE,
+                )
+
+                print("🚨🚨🚨 EMERGENCY MARKET CLOSE RESPONSE 🚨🚨🚨")
+                print(emergency_close_result)
+
+            except Exception as close_e:
+                log_exception("🚨🚨🚨 EMERGENCY MARKET CLOSE FAILED 🚨🚨🚨", close_e)
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": f"TP/SL failed after filled entry: {e}",
+                        "emergency_close_error": str(close_e),
+                        "main": main_result,
+                    },
+                )
+
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": f"TP/SL failed after filled entry: {e}",
+                    "emergency_close": emergency_close_result,
+                    "main": main_result,
+                },
+            )
 
     return {
         "ok": True,
         "mode": "live_entry" if not one_shot_results else "live_entry_one_shot_tpsl",
         "main": main_result,
+        "filled_size": str(filled_size),
         "tpsl": one_shot_results if one_shot_results else None,
         "tv_order_id": tv_order_id,
         "dedup_key": dedup_key,
