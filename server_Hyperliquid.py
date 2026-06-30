@@ -146,7 +146,7 @@ def is_429(e: Exception) -> bool:
     return "429" in msg or "rate" in msg.lower()
 
 
-def get_exchange(max_attempts: int = 5) -> Exchange:
+def get_exchange(max_attempts: int = 10) -> Exchange:
     global _exchange
 
     if not HL_ACCOUNT_ADDRESS or not HL_SECRET_KEY:
@@ -189,7 +189,7 @@ def get_exchange(max_attempts: int = 5) -> Exchange:
     raise HTTPException(status_code=503, detail=f"Failed to init Exchange after retries: {last_err}")
 
 
-def fetch_all_mids_with_retry(max_attempts: int = 5):
+def fetch_all_mids_with_retry(max_attempts: int = 10):
     url = f"{HL_BASE_URL}/info"
     payload = {"type": "allMids"}
 
@@ -225,7 +225,7 @@ def hl_order_with_retry(
     tif: str,
     reduce_only: bool,
     order_type_wire: dict,
-    max_attempts: int = 5,
+    max_attempts: int = 10,
 ) -> dict:
     backoff = 1
     last_err = None
@@ -259,7 +259,7 @@ def hl_market_open_with_retry(
     is_buy: bool,
     sz: Decimal,
     slippage: float,
-    max_attempts: int = 5,
+    max_attempts: int = 10,
 ) -> dict:
     """
     Uses the official SDK "market_open" which implements market via aggressive IOC limit internally.
