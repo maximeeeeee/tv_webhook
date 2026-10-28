@@ -2,5 +2,7 @@ fastapi
 uvicorn[standard]
 requests
 hyperliquid-python-sdk
+certifi>=2026.10.19
+
 
 
